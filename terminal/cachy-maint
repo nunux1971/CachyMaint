@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  cachy-maint — Outil de maintenance pour CachyOS (et Arch Linux)
+#  Usage : cachy-maint            -> menu interactif
+#          cachy-maint --auto     -> maintenance complète guidée
+#          cachy-maint --check    -> bilan de santé (aucune modification)
+#          cachy-maint --help
+# =============================================================================
+
+set -o pipefail
+
+VERSION="1.0.0"
+APP="cachy-maint"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/$APP"
+LOG_FILE="$STATE_DIR/maintenance.log"
+mkdir -p "$STATE_DIR"
+
+# ---------- Couleurs ---------------------------------------------------------
+if [[ -t 1 ]]; then
+  R=$'\e[31m'; G=$'\e[32m'; Y=$'\e[33m'; B=$'\e[34m'; M=$'\e[35m'; C=$'\e[36m'
+  W=$'\e[1m'; D=$'\e[2m'; N=$'\e[0m'
+else
+  R=; G=; Y=; B=; M=; C=; W=; D=; N=
+fi
+
+# ---------- Utilitaires ------------------------------------------------------
+log()   { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE"; }
+info()  { printf '%s➜%s %s\n' "$C" "$N" "$*"; log "INFO  $*"; }
+ok()    { printf '%s✔%s %s\n' "$G" "$N" "$*"; log "OK    $*"; }
+warn()  { printf '%s⚠%s %s\n' "$Y" "$N" "$*"; log "WARN  $*"; }
+err()   { printf '%s✘%s %s\n' "$R" "$N" "$*"; log "ERROR $*"; }
+title() { printf '\n%s%s━━━ %s ━━━%s\n' "$W" "$M" "$*" "$N"; log "===== $* ====="; }
+have()  { command -v "$1" >/dev/null 2>&1; }
+pause() { [[ -t 0 ]] && read -rp "${D}Appuie sur Entrée pour continuer…${N}" _; }
+
+ask() { # ask "question" [défaut o/n]
+  local q="$1" def="${2:-o}" rep hint="[O/n]"
+  [[ $def == n ]] && hint="[o/N]"
+  [[ ${ASSUME_YES:-0} == 1 ]] && return 0
+  read -rp "${Y}?${N} $q $hint " rep
+  rep="${rep:-$def}"
+  [[ ${rep,,} =~ ^(o|oui|y|yes)$ ]]
+}
+
+run() { # exécute et journalise une commande
+  printf '%s$ %s%s\n' "$D" "$*" "$N"
+  log "CMD   $*"
+  "$@"
+  local rc=$?
+  if (( rc == 0 )); then log "rc=0"; else log "rc=$rc"; fi
+  return $rc
+}
+
+need_sudo() {
+  if ! sudo -n true 2>/dev/null; then
+    info "Droits administrateur requis."
+    sudo -v || { err "Authentification sudo refusée."; return 1; }
+  fi
+}
+
+aur_helper() {
+  for h in paru yay; do have "$h" && { echo "$h"; return; }; done
+}
+
+human() { numfmt --to=iec --suffix=B "${1:-0}" 2>/dev/null || echo "${1}o"; }
+
+dir_size() { du -sb "$1" 2>/dev/null | cut -f1; }
+
+pacman_locked() {
+  if [[ -e /var/lib/pacman/db.lck ]]; then
+    if pgrep -x pacman >/dev/null || pgrep -x paru >/dev/null || pgrep -x yay >/dev/null; then
+      err "pacman est déjà en cours d'exécution. Réessaie plus tard."
+    else
+      warn "Verrou pacman orphelin détecté (/var/lib/pacman/db.lck)."
+      if ask "Supprimer ce verrou (aucun pacman ne tourne) ?" n; then
+        need_sudo && run sudo rm -f /var/lib/pacman/db.lck && return 1
+      fi
+    fi
+    return 0
+  fi
+  return 1
+}
+
+# =============================================================================
+#  ACTIONS
+# =============================================================================
+
+sys_info() {
+  title "Informations système"
+  local os kernel up
+  os=$(grep -oP '(?<=^PRETTY_NAME=").*(?=")' /etc/os-release 2>/dev/null)
+  kernel=$(uname -r)
+  up=$(uptime -p 2>/dev/null | sed 's/^up //')
+  printf '  %-18s %s\n' "Système"   "${os:-inconnu}" \
+                        "Noyau"     "$kernel" \
+                        "Machine"   "$(hostname 2>/dev/null || cat /etc/hostname)" \
+                        "Allumé depuis" "$up" \
+                        "Paquets"   "$(pacman -Qq | wc -l) (dont $(pacman -Qqm | wc -l) AUR/externes)" \
+                        "Assistant AUR" "$(aur_helper || echo aucun)"
+  if [[ -r /proc/cpuinfo ]]; then
+    printf '  %-18s %s\n' "Processeur" "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
+  fi
+  printf '  %-18s %s\n' "Mémoire" "$(free -h | awk '/^Mem/{print $3" / "$2" utilisés"}')"
+  # Noyau installé plus récent que celui chargé -> redémarrage conseillé
+  if [[ ! -d /usr/lib/modules/$kernel ]]; then
+    warn "Le noyau en cours ($kernel) n'est plus installé : un redémarrage est conseillé."
+  fi
+}
+
+check_updates() {
+  title "Mises à jour disponibles"
+  if have checkupdates; then
+    local n list
+    list=$(checkupdates 2>/dev/null); n=$(grep -c . <<<"$list")
+    if (( n > 0 )); then
+      info "$n mise(s) à jour officielle(s) :"; sed 's/^/    /' <<<"$list"
+    else ok "Dépôts officiels : à jour."; fi
+  else
+    warn "checkupdates absent (paquet pacman-contrib)."
+  fi
+  local h; h=$(aur_helper)
+  if [[ -n $h ]]; then
+    local aur; aur=$("$h" -Qua 2>/dev/null)
+    if [[ -n $aur ]]; then info "AUR ($h) :"; sed 's/^/    /' <<<"$aur"
+    else ok "AUR : à jour."; fi
+  fi
+  if have flatpak; then
+    local fp; fp=$(flatpak remote-ls --updates 2>/dev/null)
+    if [[ -n $fp ]]; then info "Flatpak :"; sed 's/^/    /' <<<"$fp"
+    else ok "Flatpak : à jour."; fi
+  fi
+}
+
+full_update() {
+  title "Mise à jour complète du système"
+  pacman_locked && return 1
+  need_sudo || return 1
+  info "Actualisation du trousseau de clés…"
+  run sudo pacman -Sy --needed --noconfirm archlinux-keyring cachyos-keyring 2>/dev/null \
+    || run sudo pacman -Sy --needed --noconfirm archlinux-keyring
+  local h; h=$(aur_helper)
+  if [[ -n $h ]]; then
+    info "Mise à jour dépôts + AUR avec $h"
+    run "$h" -Syu || { err "La mise à jour a échoué."; return 1; }
+  else
+    run sudo pacman -Syu || { err "La mise à jour a échoué."; return 1; }
+  fi
+  if have flatpak; then
+    info "Mise à jour des Flatpak"
+    run flatpak update -y
+    run flatpak uninstall --unused -y
+  fi
+  ok "Mise à jour terminée."
+  check_pacnew_quiet
+  check_reboot
+}
+
+check_reboot() {
+  local kernel; kernel=$(uname -r)
+  if [[ ! -d /usr/lib/modules/$kernel ]]; then
+    warn "Un nouveau noyau a été installé : ${W}redémarre${N} pour l'utiliser."
+  fi
+  if have needrestart; then sudo needrestart -b 2>/dev/null | grep -i 'NEEDRESTART-KSTA: [23]' >/dev/null \
+    && warn "needrestart recommande un redémarrage."; fi
+}
+
+clean_pkg_cache() {
+  title "Nettoyage du cache des paquets"
+  local before; before=$(dir_size /var/cache/pacman/pkg)
+  info "Taille actuelle : $(human "$before")"
+  if ! have paccache; then
+    warn "paccache absent. Installe-le : sudo pacman -S pacman-contrib"; return 1
+  fi
+  need_sudo || return 1
+  info "Conservation des 2 dernières versions des paquets installés"
+  run sudo paccache -rk2
+  info "Suppression de toutes les versions des paquets désinstallés"
+  run sudo paccache -ruk0
+  local h; h=$(aur_helper)
+  if [[ -n $h ]] && ask "Nettoyer aussi le cache de compilation AUR ($h) ?" o; then
+    run "$h" -Sc --aur --noconfirm 2>/dev/null || run "$h" -Sc
+  fi
+  local after; after=$(dir_size /var/cache/pacman/pkg)
+  ok "Cache pacman : $(human "$before") → $(human "$after")"
+}
+
+remove_orphans() {
+  title "Paquets orphelins"
+  local orphans; orphans=$(pacman -Qdtq 2>/dev/null)
+  if [[ -z $orphans ]]; then ok "Aucun paquet orphelin."; return; fi
+  info "Paquets installés comme dépendances mais plus utilisés :"
+  pacman -Qdt | sed 's/^/    /'
+  if ask "Les supprimer ?" o; then
+    pacman_locked && return 1
+    need_sudo || return 1
+    # shellcheck disable=SC2086
+    run sudo pacman -Rns $orphans
+  fi
+}
+
+clean_journal() {
+  title "Journaux système (journald)"
+  journalctl --disk-usage 2>/dev/null | sed 's/^/  /'
+  if ask "Ne garder que 2 semaines de journaux (max 500 Mo) ?" o; then
+    need_sudo || return 1
+    run sudo journalctl --vacuum-time=2weeks --vacuum-size=500M
+  fi
+}
+
+clean_user_cache() {
+  title "Cache utilisateur"
+  local c="$HOME/.cache"
+  [[ -d $c ]] || { ok "Pas de ~/.cache"; return; }
+  info "Taille de ~/.cache : $(human "$(dir_size "$c")")"
+  info "Plus gros dossiers :"
+  du -sh "$c"/* 2>/dev/null | sort -rh | head -8 | sed 's/^/    /'
+  if [[ -d $c/thumbnails ]] && ask "Vider les miniatures ($(human "$(dir_size "$c/thumbnails")")) ?" o; then
+    run find "$c/thumbnails" -type f -delete
+  fi
+  if ask "Supprimer les fichiers de ~/.cache non utilisés depuis 90 jours ?" n; then
+    local n; n=$(find "$c" -type f -atime +90 2>/dev/null | wc -l)
+    run find "$c" -type f -atime +90 -delete
+    find "$c" -mindepth 1 -type d -empty -delete 2>/dev/null
+    ok "$n fichier(s) supprimé(s)."
+  fi
+  have trash-empty && ask "Vider la corbeille ?" n && run trash-empty
+}
+
+check_pacnew_quiet() {
+  local files; files=$(find /etc -regextype posix-extended -regex '.*\.(pacnew|pacsave)$' 2>/dev/null)
+  [[ -n $files ]] && warn "$(grep -c . <<<"$files") fichier(s) .pacnew/.pacsave à traiter (menu « Fichiers de configuration »)."
+}
+
+check_pacnew() {
+  title "Fichiers .pacnew / .pacsave"
+  local files; files=$(find /etc -regextype posix-extended -regex '.*\.(pacnew|pacsave)$' 2>/dev/null)
+  if [[ -z $files ]]; then ok "Aucun fichier en attente."; return; fi
+  warn "Fichiers à fusionner :"; sed 's/^/    /' <<<"$files"
+  if have pacdiff; then
+    echo
+    info "pacdiff permet de comparer, fusionner ou supprimer chaque fichier."
+    info "Astuce : export DIFFPROG=meld (graphique) ou laisse vimdiff par défaut."
+    if ask "Lancer pacdiff maintenant ?" n; then
+      need_sudo || return 1
+      run sudo DIFFPROG="${DIFFPROG:-vimdiff}" pacdiff
+    fi
+  else
+    warn "pacdiff absent (paquet pacman-contrib)."
+  fi
+}
+
+check_services() {
+  title "Services systemd"
+  local failed; failed=$(systemctl --failed --no-legend --plain 2>/dev/null)
+  if [[ -z $failed ]]; then ok "Aucun service système en échec."
+  else err "Services système en échec :"; sed 's/^/    /' <<<"$failed"
+       info "Détails : systemctl status <service>  |  Réinitialiser : sudo systemctl reset-failed"
+  fi
+  local ufailed; ufailed=$(systemctl --user --failed --no-legend --plain 2>/dev/null)
+  if [[ -z $ufailed ]]; then ok "Aucun service utilisateur en échec."
+  else err "Services utilisateur en échec :"; sed 's/^/    /' <<<"$ufailed"; fi
+}
+
+check_logs() {
+  title "Erreurs depuis le dernier démarrage"
+  local n; n=$(journalctl -b -p 3 --no-pager -q 2>/dev/null | wc -l)
+  if (( n == 0 )); then ok "Aucune erreur critique dans le journal."; return; fi
+  warn "$n ligne(s) d'erreur. Les 25 dernières :"
+  journalctl -b -p 3 --no-pager -q 2>/dev/null | tail -25 | sed 's/^/    /'
+  info "Journal complet : journalctl -b -p 3"
+}
+
+rate_mirrors() {
+  title "Classement des miroirs"
+  need_sudo || return 1
+  if have cachyos-rate-mirrors; then
+    info "Test des miroirs CachyOS et Arch (cela peut prendre 1 à 2 minutes)…"
+    run sudo cachyos-rate-mirrors && ok "Miroirs mis à jour."
+  elif have rate-mirrors; then
+    run bash -c "rate-mirrors --save=/tmp/mirrorlist arch && sudo install -m644 /tmp/mirrorlist /etc/pacman.d/mirrorlist"
+  elif have reflector; then
+    run sudo reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+  else
+    warn "Aucun outil trouvé (cachyos-rate-mirrors, rate-mirrors ou reflector)."
+  fi
+}
+
+disk_health() {
+  title "Disques et espace"
+  df -hT -x tmpfs -x devtmpfs -x efivarfs -x squashfs -x overlay 2>/dev/null | sed 's/^/  /'
+  # Alerte remplissage
+  while read -r use mnt; do
+    use=${use%\%}
+    [[ $use =~ ^[0-9]+$ ]] || continue
+    (( use >= 90 )) && err "$mnt est plein à ${use}% !"
+    (( use >= 80 && use < 90 )) && warn "$mnt est rempli à ${use}%."
+  done < <(df --output=pcent,target -x tmpfs -x devtmpfs -x efivarfs -x squashfs -x overlay 2>/dev/null | tail -n +2)
+
+  # Btrfs
+  if findmnt -t btrfs / >/dev/null 2>&1; then
+    echo; info "Racine en Btrfs :"
+    sudo -n true 2>/dev/null || need_sudo
+    sudo btrfs filesystem usage -T / 2>/dev/null | head -12 | sed 's/^/    /'
+    local berr; berr=$(sudo btrfs device stats / 2>/dev/null | grep -v ' 0$')
+    if [[ -n $berr ]]; then sed 's/^/    /' <<<"$berr"; warn "Erreurs Btrfs détectées ci-dessus !"
+    else ok "Aucune erreur Btrfs enregistrée."; fi
+  fi
+
+  # SMART
+  echo
+  if have smartctl; then
+    need_sudo || return 1
+    local dev
+    for dev in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'); do
+      local res; res=$(sudo smartctl -H "$dev" 2>/dev/null | grep -Ei 'overall-health|SMART Health Status|result')
+      if [[ -z $res ]]; then printf '  %-14s %s\n' "$dev" "${D}SMART non disponible${N}"
+      elif grep -qiE 'PASSED|OK' <<<"$res"; then printf '  %-14s %s\n' "$dev" "${G}sain${N}"
+      else printf '  %-14s %s\n' "$dev" "${R}$res${N}"; log "SMART $dev $res"; fi
+    done
+  else
+    warn "smartctl absent : sudo pacman -S smartmontools pour vérifier la santé des disques."
+  fi
+}
+
+btrfs_scrub() {
+  title "Vérification d'intégrité Btrfs (scrub)"
+  findmnt -t btrfs / >/dev/null 2>&1 || { warn "La racine n'est pas en Btrfs."; return; }
+  need_sudo || return 1
+  sudo btrfs scrub status / 2>/dev/null | sed 's/^/    /'
+  if ask "Lancer un scrub en arrière-plan (le PC reste utilisable) ?" n; then
+    run sudo btrfs scrub start / && info "Suis la progression avec : sudo btrfs scrub status /"
+  fi
+}
+
+snapshots() {
+  title "Instantanés (snapshots)"
+  if have snapper; then
+    need_sudo || return 1
+    run sudo snapper list | tail -15
+    if ask "Créer un instantané manuel maintenant ?" n; then
+      run sudo snapper create -d "cachy-maint $(date '+%F %H:%M')" && ok "Instantané créé."
+    fi
+  elif have timeshift; then
+    need_sudo || return 1
+    run sudo timeshift --list
+    if ask "Créer un instantané Timeshift maintenant ?" n; then
+      run sudo timeshift --create --comments "cachy-maint" && ok "Instantané créé."
+    fi
+  else
+    warn "Ni snapper ni timeshift installé. Sur CachyOS : sudo pacman -S snapper btrfs-assistant"
+  fi
+}
+
+firmware() {
+  title "Micrologiciels (fwupd)"
+  if ! have fwupdmgr; then warn "fwupd absent : sudo pacman -S fwupd"; return; fi
+  run fwupdmgr refresh --force >/dev/null 2>&1
+  run fwupdmgr get-updates
+  local rc=$?
+  if (( rc == 0 )) && ask "Installer les mises à jour de micrologiciel ?" n; then
+    run fwupdmgr update
+  fi
+}
+
+verify_packages() {
+  title "Intégrité des paquets installés"
+  info "Recherche des fichiers manquants (rapide)…"
+  local out; out=$(pacman -Qk 2>/dev/null | grep -v ' 0 missing files')
+  if [[ -z $out ]]; then ok "Aucun fichier manquant."
+  else warn "Paquets avec fichiers manquants :"; sed 's/^/    /' <<<"$out"
+       info "Pour réparer : sudo pacman -S <paquet>"; fi
+  local broken; broken=$(pacman -Dk 2>&1 | grep -v '^No database errors')
+  if [[ -n $broken ]]; then warn "Problèmes de dépendances :"; sed 's/^/    /' <<<"$broken"
+  else ok "Base de données pacman cohérente."; fi
+}
+
+big_packages() {
+  title "Les 20 paquets les plus volumineux"
+  LC_ALL=C pacman -Qi 2>/dev/null | awk -F': ' '
+    /^Name/ {n=$2}
+    /^Installed Size/ {
+      split($2,a," "); s=a[1]; u=a[2]
+      m=(u=="KiB")?1/1024:(u=="GiB")?1024:(u=="B")?1/1048576:1
+      printf "%10.1f Mo  %s\n", s*m, n }' | sort -rn | head -20 | sed 's/^/  /'
+}
+
+show_log() {
+  title "Journal de cachy-maint"
+  [[ -s $LOG_FILE ]] && tail -40 "$LOG_FILE" || info "Journal vide."
+  info "Fichier complet : $LOG_FILE"
+}
+
+# ---------- Scénarios --------------------------------------------------------
+health_check() {
+  sys_info; check_updates; check_services; check_logs; disk_health; check_pacnew
+  local o; o=$(pacman -Qdtq 2>/dev/null | wc -l)
+  (( o > 0 )) && warn "$o paquet(s) orphelin(s)." || ok "Aucun paquet orphelin."
+  title "Bilan terminé"
+}
+
+auto_maintenance() {
+  title "Maintenance complète"
+  info "Étapes : instantané → mise à jour → orphelins → caches → journaux → contrôles"
+  ask "Démarrer ?" o || return
+  have snapper && need_sudo && run sudo snapper create -d "avant cachy-maint $(date '+%F %H:%M')" \
+    && ok "Instantané de sécurité créé."
+  full_update || { err "Arrêt : corrige la mise à jour avant de continuer."; return 1; }
+  remove_orphans
+  clean_pkg_cache
+  clean_journal
+  check_services
+  check_pacnew
+  date '+%F' >"$STATE_DIR/last_run"
+  title "Maintenance terminée ✔"
+  check_reboot
+}
+
+# ---------- Menu -------------------------------------------------------------
+banner() {
+  clear 2>/dev/null
+  local last="jamais"; [[ -f $STATE_DIR/last_run ]] && last=$(<"$STATE_DIR/last_run")
+  printf '%s%s' "$W" "$C"
+  cat <<'EOF'
+   ____           _              __  __       _       _
+  / ___|__ _  ___| |__  _   _   |  \/  | __ _(_)_ __ | |_
+ | |   / _` |/ __| '_ \| | | |  | |\/| |/ _` | | '_ \| __|
+ | |__| (_| | (__| | | | |_| |  | |  | | (_| | | | | | |_
+  \____\__,_|\___|_| |_|\__, |  |_|  |_|\__,_|_|_| |_|\__|
+                        |___/
+EOF
+  printf '%s  Maintenance CachyOS v%s  •  dernière maintenance complète : %s%s\n' "$D" "$VERSION" "$last" "$N"
+}
+
+menu() {
+  while true; do
+    banner
+    cat <<EOF
+
+  ${W}Maintenance${N}
+   ${G}1${N}) Maintenance complète (recommandé)   ${G}2${N}) Bilan de santé (lecture seule)
+
+  ${W}Mises à jour${N}
+   ${C}3${N}) Voir les mises à jour disponibles   ${C}4${N}) Tout mettre à jour (pacman, AUR, Flatpak)
+   ${C}5${N}) Classer les miroirs                 ${C}6${N}) Micrologiciels (fwupd)
+
+  ${W}Nettoyage${N}
+   ${Y}7${N}) Paquets orphelins                   ${Y}8${N}) Cache des paquets
+   ${Y}9${N}) Journaux système                   ${Y}10${N}) Cache utilisateur / corbeille
+
+  ${W}Diagnostic${N}
+  ${B}11${N}) Services en échec                  ${B}12${N}) Erreurs du journal
+  ${B}13${N}) Disques, espace, SMART, Btrfs      ${B}14${N}) Fichiers .pacnew / .pacsave
+  ${B}15${N}) Intégrité des paquets              ${B}16${N}) Paquets les plus volumineux
+
+  ${W}Sécurité${N}
+  ${M}17${N}) Instantanés (snapper/timeshift)    ${M}18${N}) Scrub Btrfs
+  ${M}19${N}) Informations système               ${M}20${N}) Journal de cachy-maint
+
+   ${R}0${N}) Quitter
+EOF
+    echo
+    read -rp "  Ton choix : " c
+    case $c in
+      1) auto_maintenance ;;  2) health_check ;;
+      3) check_updates ;;     4) full_update ;;
+      5) rate_mirrors ;;      6) firmware ;;
+      7) remove_orphans ;;    8) clean_pkg_cache ;;
+      9) clean_journal ;;    10) clean_user_cache ;;
+     11) check_services ;;   12) check_logs ;;
+     13) disk_health ;;      14) check_pacnew ;;
+     15) verify_packages ;;  16) big_packages ;;
+     17) snapshots ;;        18) btrfs_scrub ;;
+     19) sys_info ;;         20) show_log ;;
+     0|q|Q) echo "À bientôt !"; exit 0 ;;
+      *) warn "Choix invalide." ;;
+    esac
+    echo; pause
+  done
+}
+
+usage() {
+  cat <<EOF
+$APP v$VERSION — maintenance de CachyOS
+
+Usage :
+  $APP              menu interactif
+  $APP --auto       maintenance complète (pose les questions)
+  $APP --auto -y    maintenance complète sans question
+  $APP --check      bilan de santé, ne modifie rien
+  $APP --update     mise à jour complète uniquement
+  $APP --help       cette aide
+
+Journal : $LOG_FILE
+EOF
+}
+
+# ---------- Point d'entrée ---------------------------------------------------
+[[ $EUID -eq 0 ]] && { err "Lance $APP en utilisateur normal (il demandera sudo au besoin)."; exit 1; }
+have pacman || { err "pacman introuvable : ce script est prévu pour CachyOS / Arch."; exit 1; }
+
+for a in "$@"; do [[ $a == -y || $a == --yes ]] && ASSUME_YES=1; done
+case ${1:-} in
+  --auto)   auto_maintenance ;;
+  --check)  health_check ;;
+  --update) full_update ;;
+  -h|--help) usage ;;
+  ""|-y|--yes) menu ;;
+  *) usage; exit 1 ;;
+esac

@@ -1,0 +1,1097 @@
+#!/usr/bin/env python3
+# =============================================================================
+#  Cachy Maint — interface graphique de maintenance pour CachyOS / Arch Linux
+#  Python 3 + PySide6 (Qt 6). Les actions administrateur passent par pkexec
+#  et le programme /usr/local/libexec/cachy-maint-helper.
+# =============================================================================
+from __future__ import annotations
+
+import datetime as dt
+import html
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from PySide6.QtCore import (QObject, QProcess, QProcessEnvironment, QSize, Qt,
+                            QThread, QTimer, QUrl, Signal)
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
+                           QIcon, QPalette, QTextCharFormat, QTextCursor)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
+                               QGridLayout, QHBoxLayout, QHeaderView, QLabel,
+                               QListWidget, QListWidgetItem, QMainWindow,
+                               QMessageBox, QPlainTextEdit, QProgressBar,
+                               QPushButton, QScrollArea, QSplitter, QStackedWidget, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
+
+APP_NAME = "Cachy Maint"
+VERSION = "2.0.0"
+HELPER = "/usr/local/libexec/cachy-maint-helper"
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "cachy-maint"
+LOG = STATE / "maintenance.log"
+LAST_RUN = STATE / "last_run"
+HOME_CACHE = Path.home() / ".cache"
+
+GREEN, ORANGE, RED, BLUE = "#27ae60", "#f39c12", "#da4453", "#3daee9"
+REAL_FS = {"ext4", "ext3", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs3",
+           "ntfs", "fuseblk", "jfs", "bcachefs", "zfs"}
+
+STATE.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+#  Outils
+# =============================================================================
+def have(cmd: str) -> bool:
+    return shutil.which(cmd) is not None
+
+
+def sh(cmd, timeout: int = 60) -> tuple[int, str]:
+    """Exécute une commande (liste ou chaîne shell) et renvoie (code, sortie)."""
+    env = dict(os.environ, LC_ALL="C")
+    try:
+        p = subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True,
+                           text=True, timeout=timeout, env=env)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+
+
+def human(n: float | None) -> str:
+    if n is None:
+        return "?"
+    for unit in ("o", "Ko", "Mo", "Go", "To"):
+        if abs(n) < 1024 or unit == "To":
+            return f"{n:.0f} {unit}" if unit in ("o", "Ko") else f"{n:.1f} {unit}"
+        n /= 1024
+    return "?"
+
+
+def dir_size(path: Path | str) -> int | None:
+    if not Path(path).exists():
+        return 0
+    _, out = sh(["du", "-sb", str(path)], timeout=120)
+    try:
+        return int(out.split()[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def fmt_duration(seconds: float) -> str:
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    parts = ([f"{d} j"] if d else []) + ([f"{h} h"] if h else []) + [f"{m} min"]
+    return " ".join(parts)
+
+
+def aur_helper() -> str | None:
+    return next((h for h in ("paru", "yay") if have(h)), None)
+
+
+def find_terminal() -> list[str] | None:
+    for name, args in (("konsole", ["konsole", "-e"]), ("kitty", ["kitty"]),
+                       ("alacritty", ["alacritty", "-e"]), ("ghostty", ["ghostty", "-e"]),
+                       ("wezterm", ["wezterm", "start", "--"]), ("foot", ["foot"]),
+                       ("gnome-terminal", ["gnome-terminal", "--"]),
+                       ("xfce4-terminal", ["xfce4-terminal", "-x"]), ("xterm", ["xterm", "-e"])):
+        if have(name):
+            return args
+    return None
+
+
+def log_line(text: str) -> None:
+    try:
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(f"[{dt.datetime.now():%F %T}] {text.rstrip()}\n")
+    except OSError:
+        pass
+
+
+UPD_RE = re.compile(r"^(\S+)\s+(\S+)\s+->\s+(\S+)")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def parse_updates(text: str, source: str) -> list[tuple[str, str, str, str]]:
+    res = []
+    for line in text.splitlines():
+        m = UPD_RE.match(line.strip())
+        if m:
+            res.append((m.group(1), m.group(2), m.group(3), source))
+    return res
+
+
+# =============================================================================
+#  Collecte des informations (dans un fil séparé pour ne pas figer la fenêtre)
+# =============================================================================
+def collect_quick() -> dict:
+    d: dict = {}
+    osr = {}
+    try:
+        for line in Path("/etc/os-release").read_text().splitlines():
+            k, _, v = line.partition("=")
+            osr[k] = v.strip().strip('"')
+    except OSError:
+        pass
+    d["os"] = osr.get("PRETTY_NAME", "Linux")
+    d["kernel"] = platform.release()
+    d["reboot"] = not Path(f"/usr/lib/modules/{d['kernel']}").exists()
+    try:
+        d["uptime"] = fmt_duration(float(Path("/proc/uptime").read_text().split()[0]))
+    except (OSError, ValueError):
+        d["uptime"] = "?"
+    d["host"] = platform.node()
+    d["pkgs"] = len(sh(["pacman", "-Qq"])[1].split())
+    d["foreign"] = len(sh(["pacman", "-Qqm"])[1].split())
+    d["orphans"] = sh(["pacman", "-Qdtq"])[1].split()
+    d["aur_helper"] = aur_helper()
+    d["locked"] = Path("/var/lib/pacman/db.lck").exists()
+
+    failed = []
+    for scope, prefix in (([], ""), (["--user"], "(utilisateur) ")):
+        _, out = sh(["systemctl", *scope, "--failed", "--no-legend", "--plain"])
+        failed += [prefix + l.split()[0] for l in out.splitlines() if l.strip()]
+    d["failed"] = failed
+
+    _, out = sh("journalctl -b -p 3 -q --no-pager 2>/dev/null | wc -l")
+    d["errors"] = int(out.strip() or 0)
+
+    _, out = sh(r"find /etc \( -name '*.pacnew' -o -name '*.pacsave' \) 2>/dev/null")
+    d["pacnew"] = out.split()
+
+    disks, seen = [], set()
+    try:
+        mounts = Path("/proc/mounts").read_text().splitlines()
+    except OSError:
+        mounts = []
+    for line in mounts:
+        parts = line.split()
+        if len(parts) < 3 or parts[2] not in REAL_FS or parts[0] in seen:
+            continue
+        mnt = parts[1].replace("\\040", " ")
+        try:
+            u = shutil.disk_usage(mnt)
+        except OSError:
+            continue
+        seen.add(parts[0])
+        disks.append((mnt, parts[2], u.used, u.total))
+    d["disks"] = disks
+
+    d["pkgcache"] = dir_size("/var/cache/pacman/pkg")
+    d["usercache"] = dir_size(HOME_CACHE)
+    d["thumbs"] = dir_size(HOME_CACHE / "thumbnails")
+    d["aur_cache_dir"] = next((HOME_CACHE / h for h in ("paru/clone", "yay")
+                               if (HOME_CACHE / h).is_dir()), None)
+    d["aur_cache"] = dir_size(d["aur_cache_dir"]) if d["aur_cache_dir"] else 0
+    _, out = sh(["journalctl", "--disk-usage"])
+    m = re.search(r"take up ([\d.,]+\s*\S+)", out)
+    d["journal"] = m.group(1) if m else "?"
+    d["last_run"] = LAST_RUN.read_text().strip() if LAST_RUN.exists() else None
+    d["btrfs"] = sh(["findmnt", "-t", "btrfs", "/"])[0] == 0
+    d["snap_tool"] = "snapper" if have("snapper") else ("timeshift" if have("timeshift") else None)
+    return d
+
+
+def collect_slow() -> dict:
+    d: dict = {"updates": [], "updates_error": None}
+    if have("checkupdates"):
+        rc, out = sh(["checkupdates"], timeout=180)
+        if rc == 1:
+            d["updates_error"] = "checkupdates a échoué (réseau ?)"
+        d["updates"] += parse_updates(out, "Dépôts")
+    else:
+        d["updates_error"] = "checkupdates absent (installe pacman-contrib)"
+    h = aur_helper()
+    if h:
+        _, out = sh([h, "-Qua"], timeout=180)
+        d["updates"] += parse_updates(out, "AUR")
+    if have("flatpak"):
+        _, out = sh(["flatpak", "remote-ls", "--updates", "--columns=application,version"], timeout=120)
+        for line in out.splitlines():
+            cols = line.split("\t")
+            if cols and cols[0] and "." in cols[0]:
+                d["updates"].append((cols[0], "", cols[1] if len(cols) > 1 else "", "Flatpak"))
+    return d
+
+
+class Collector(QThread):
+    partial = Signal(dict)
+
+    def run(self):
+        self.partial.emit(collect_quick())
+        self.partial.emit(collect_slow())
+
+
+# =============================================================================
+#  Exécution des tâches (une file d'étapes, sortie diffusée en direct)
+# =============================================================================
+class Step:
+    def __init__(self, label: str, argv: list[str], root: bool = False,
+                 stop_on_fail: bool = True, ok_codes: tuple = (0,)):
+        self.label, self.argv, self.root = label, argv, root
+        self.stop_on_fail, self.ok_codes = stop_on_fail, ok_codes
+
+
+class Runner(QObject):
+    output = Signal(str, str)     # texte, genre : out / info / ok / err / title
+    busy_changed = Signal(bool, str)
+    done = Signal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.proc: QProcess | None = None
+        self.queue: list[Step] = []
+        self.current: Step | None = None
+        self.ok = True
+
+    def busy(self) -> bool:
+        return self.proc is not None or bool(self.queue)
+
+    def start(self, title: str, steps: list[Step]) -> bool:
+        if self.busy():
+            return False
+        self.queue, self.ok = list(steps), True
+        self.output.emit(f"━━━ {title} — {dt.datetime.now():%H:%M} ━━━", "title")
+        log_line(f"===== {title} =====")
+        self._next()
+        return True
+
+    def stop(self):
+        self.queue.clear()
+        if self.proc is None:
+            return
+        if self.current and self.current.root:
+            self.output.emit("La tâche administrateur en cours va se terminer d'elle-même ; "
+                             "les étapes suivantes sont annulées.", "info")
+        else:
+            self.proc.kill()
+            self.output.emit("Tâche interrompue.", "err")
+
+    def _next(self):
+        if not self.queue:
+            self.proc, self.current = None, None
+            self.busy_changed.emit(False, "")
+            self.done.emit(self.ok)
+            return
+        s = self.current = self.queue.pop(0)
+        argv = ["pkexec", HELPER, *s.argv] if s.root else s.argv
+        self.output.emit(f"➜ {s.label}", "info")
+        log_line(f"CMD {' '.join(argv)}")
+        self.busy_changed.emit(True, s.label)
+        p = QProcess(self)
+        p.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("TERM", "dumb")
+        env.insert("NO_COLOR", "1")
+        p.setProcessEnvironment(env)
+        p.readyReadStandardOutput.connect(self._read)
+        p.finished.connect(self._finished)
+        p.errorOccurred.connect(self._error)
+        self.proc = p
+        p.start(argv[0], argv[1:])
+
+    def _read(self):
+        if not self.proc:
+            return
+        text = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
+        text = ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+        if text:
+            self.output.emit(text, "out")
+            log_line(text)
+
+    def _finished(self, code: int, status):
+        s = self.current
+        self._read()
+        if status == QProcess.ExitStatus.CrashExit or code not in s.ok_codes:
+            if s.root and code in (126, 127):
+                msg = f"✘ {s.label} : authentification annulée ou refusée."
+            else:
+                msg = f"✘ {s.label} : échec (code {code})."
+            self.output.emit(msg, "err")
+            log_line(msg)
+            self.ok = False
+            if s.stop_on_fail:
+                self.queue.clear()
+        else:
+            self.output.emit(f"✔ {s.label}", "ok")
+            log_line(f"OK {s.label}")
+        if self.proc:
+            self.proc.deleteLater()
+        self.proc = None
+        self._next()
+
+    def _error(self, err):
+        if err == QProcess.ProcessError.FailedToStart:
+            self.output.emit(f"✘ Impossible de lancer « {self.current.argv[0]} ».", "err")
+            self.ok = False
+            self.queue.clear()
+            if self.proc:
+                self.proc.deleteLater()
+            self.proc = None
+            self._next()
+
+
+# =============================================================================
+#  Composants d'interface
+# =============================================================================
+def icon(name: str, fallback: str = "applications-system") -> QIcon:
+    return QIcon.fromTheme(name, QIcon.fromTheme(fallback))
+
+
+def muted(label: QLabel) -> QLabel:
+    pal = label.palette()
+    pal.setColor(QPalette.ColorRole.WindowText, label.palette().color(QPalette.ColorRole.PlaceholderText))
+    label.setPalette(pal)
+    return label
+
+
+class Card(QFrame):
+    """Tuile du tableau de bord : titre, valeur, détail, bouton optionnel."""
+
+    def __init__(self, icon_name: str, title: str, button: str | None = None, slot=None):
+        super().__init__()
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setMinimumHeight(140)
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        ic = QLabel()
+        ic.setPixmap(icon(icon_name).pixmap(22, 22))
+        t = QLabel(f"<b>{html.escape(title)}</b>")
+        top.addWidget(ic)
+        top.addWidget(t)
+        top.addStretch()
+        lay.addLayout(top)
+        self.value = QLabel("…")
+        f = self.value.font()
+        f.setPointSizeF(f.pointSizeF() * 1.9)
+        f.setBold(True)
+        self.value.setFont(f)
+        lay.addWidget(self.value)
+        self.detail = muted(QLabel(""))
+        self.detail.setWordWrap(True)
+        lay.addWidget(self.detail)
+        lay.addStretch()
+        self.button = None
+        if button:
+            self.button = QPushButton(button)
+            self.button.clicked.connect(slot)
+            self.button.setEnabled(False)
+            lay.addWidget(self.button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+    def set(self, value: str, detail: str = "", level: str = "ok", action: bool = False):
+        color = {"ok": GREEN, "warn": ORANGE, "bad": RED, "info": BLUE}.get(level, "")
+        self.value.setText(value)
+        self.value.setStyleSheet(f"color:{color}" if color else "")
+        self.detail.setText(detail)
+        if self.button:
+            self.button.setEnabled(action)
+
+
+class ActionRow(QFrame):
+    """Ligne d'action : icône, titre, description, info à droite, bouton."""
+
+    def __init__(self, icon_name, title, desc, button, slot):
+        super().__init__()
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        h = QHBoxLayout(self)
+        ic = QLabel()
+        ic.setPixmap(icon(icon_name).pixmap(32, 32))
+        h.addWidget(ic)
+        v = QVBoxLayout()
+        v.addWidget(QLabel(f"<b>{html.escape(title)}</b>"))
+        d = muted(QLabel(desc))
+        d.setWordWrap(True)
+        v.addWidget(d)
+        h.addLayout(v, 1)
+        self.info = QLabel("")
+        self.info.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        h.addWidget(self.info)
+        self.button = QPushButton(button)
+        self.button.setMinimumWidth(130)
+        self.button.clicked.connect(slot)
+        h.addWidget(self.button)
+
+
+def page(title: str, subtitle: str) -> tuple[QScrollArea, QVBoxLayout]:
+    inner = QWidget()
+    lay = QVBoxLayout(inner)
+    lay.setContentsMargins(24, 20, 24, 20)
+    lay.setSpacing(10)
+    t = QLabel(title)
+    f = t.font()
+    f.setPointSizeF(f.pointSizeF() * 1.6)
+    f.setBold(True)
+    t.setFont(f)
+    lay.addWidget(t)
+    s = muted(QLabel(subtitle))
+    s.setWordWrap(True)
+    lay.addWidget(s)
+    lay.addSpacing(6)
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setWidget(inner)
+    return scroll, lay
+
+
+def section(lay: QVBoxLayout, text: str):
+    lay.addSpacing(8)
+    l = QLabel(f"<b>{html.escape(text)}</b>")
+    lay.addWidget(l)
+
+
+# =============================================================================
+#  Fenêtre principale
+# =============================================================================
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(icon("system-software-update"))
+        self.resize(1180, 820)
+        self.data: dict = {}
+        self.collector: Collector | None = None
+        self.terminals: list[QProcess] = []
+        self.after_done = None
+
+        self.runner = Runner()
+        self.runner.output.connect(self.write)
+        self.runner.busy_changed.connect(self.on_busy)
+        self.runner.done.connect(self.on_done)
+
+        # ----- Barre latérale + pages
+        self.nav = QListWidget()
+        self.nav.setFixedWidth(220)
+        self.nav.setIconSize(QSize(22, 22))
+        self.nav.setSpacing(2)
+        self.stack = QStackedWidget()
+        for name, ic, builder in (
+            ("Tableau de bord", "computer", self.build_dashboard),
+            ("Mises à jour", "system-software-update", self.build_updates),
+            ("Nettoyage", "edit-clear-all", self.build_cleanup),
+            ("Diagnostic", "dialog-information", self.build_diagnostic),
+            ("Sécurité", "security-high", self.build_security),
+            ("Historique", "view-history", self.build_history),
+        ):
+            QListWidgetItem(icon(ic), name, self.nav)
+            self.stack.addWidget(builder())
+        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(lambda i: i == 5 and self.load_history())
+        self.nav.setCurrentRow(0)
+
+        # ----- Console
+        console_box = QWidget()
+        cl = QVBoxLayout(console_box)
+        cl.setContentsMargins(8, 4, 8, 8)
+        bar = QHBoxLayout()
+        self.status = QLabel("Prêt.")
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(180)
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 1)
+        self.stop_btn = QPushButton(icon("process-stop"), "Arrêter")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.runner.stop)
+        clear_btn = QPushButton(icon("edit-clear"), "Effacer")
+        clear_btn.clicked.connect(lambda: (self.console.clear(), setattr(self, "_nl", True)))
+        bar.addWidget(QLabel("<b>Console</b>"))
+        bar.addWidget(self.status, 1)
+        bar.addWidget(self.progress)
+        bar.addWidget(self.stop_btn)
+        bar.addWidget(clear_btn)
+        cl.addLayout(bar)
+        self.console = QPlainTextEdit()
+        self.console.setReadOnly(True)
+        self.console.setMaximumBlockCount(8000)
+        self.console.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.console.setPlaceholderText("La sortie des opérations s'affichera ici.")
+        cl.addWidget(self.console)
+        self._nl = True
+
+        right = QSplitter(Qt.Orientation.Vertical)
+        right.addWidget(self.stack)
+        right.addWidget(console_box)
+        right.setStretchFactor(0, 3)
+        right.setStretchFactor(1, 2)
+        right.setSizes([520, 280])
+
+        central = QWidget()
+        h = QHBoxLayout(central)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(self.nav)
+        h.addWidget(right, 1)
+        self.setCentralWidget(central)
+
+        if not Path(HELPER).exists():
+            QTimer.singleShot(300, lambda: QMessageBox.warning(
+                self, APP_NAME,
+                "Le module administrateur n'est pas installé :\n"
+                f"{HELPER}\n\nLance install.sh pour activer les actions qui "
+                "nécessitent les droits administrateur."))
+        QTimer.singleShot(100, self.refresh)
+
+    # ------------------------------------------------------------------ pages
+    def build_dashboard(self):
+        w, lay = page("Tableau de bord", "")
+        self.dash_sub = lay.itemAt(1).widget()
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        self.c_upd = Card("system-software-update", "Mises à jour", "Mettre à jour", self.update_system)
+        self.c_orph = Card("edit-delete", "Paquets orphelins", "Supprimer", self.remove_orphans)
+        self.c_fail = Card("dialog-error", "Services en échec", "Voir", self.show_failed)
+        self.c_err = Card("dialog-warning", "Erreurs du journal", "Voir", self.show_errors)
+        self.c_pacnew = Card("document-edit", "Fichiers .pacnew", "Fusionner", self.merge_pacnew)
+        self.c_cache = Card("folder-download", "Cache des paquets", "Nettoyer", self.clean_cache)
+        self.c_reboot = Card("system-reboot", "Redémarrage")
+        self.c_last = Card("view-calendar", "Dernière maintenance")
+        for i, c in enumerate((self.c_upd, self.c_orph, self.c_fail, self.c_err,
+                               self.c_pacnew, self.c_cache, self.c_reboot, self.c_last)):
+            grid.addWidget(c, i // 4, i % 4)
+        lay.addLayout(grid)
+
+        btns = QHBoxLayout()
+        self.full_btn = QPushButton(icon("run-build", "system-run"), "  Lancer la maintenance complète")
+        self.full_btn.setMinimumHeight(42)
+        f = self.full_btn.font()
+        f.setBold(True)
+        self.full_btn.setFont(f)
+        self.full_btn.clicked.connect(self.full_maintenance)
+        self.refresh_btn = QPushButton(icon("view-refresh"), "Actualiser")
+        self.refresh_btn.setMinimumHeight(42)
+        self.refresh_btn.clicked.connect(self.refresh)
+        btns.addWidget(self.full_btn, 1)
+        btns.addWidget(self.refresh_btn)
+        lay.addLayout(btns)
+
+        section(lay, "Espace disque")
+        self.disk_box = QVBoxLayout()
+        lay.addLayout(self.disk_box)
+        lay.addStretch()
+        return w
+
+    def build_updates(self):
+        w, lay = page("Mises à jour", "Paquets des dépôts, de l'AUR et Flatpak en attente.")
+        self.upd_tree = QTreeWidget()
+        self.upd_tree.setHeaderLabels(["Paquet", "Version installée", "Nouvelle version", "Source"])
+        self.upd_tree.setRootIsDecorated(False)
+        self.upd_tree.setAlternatingRowColors(True)
+        self.upd_tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.upd_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.upd_tree.setMinimumHeight(220)
+        lay.addWidget(self.upd_tree)
+        self.upd_info = muted(QLabel(""))
+        lay.addWidget(self.upd_info)
+
+        row = QHBoxLayout()
+        for text, ic, slot in (("Rechercher", "view-refresh", self.refresh),
+                               ("Mettre à jour (dépôts + Flatpak)", "system-software-update", self.update_system),
+                               ("Mettre à jour l'AUR…", "utilities-terminal", self.update_aur),
+                               ("Tout dans un terminal…", "utilities-terminal", self.update_terminal)):
+            b = QPushButton(icon(ic), text)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+        row.addStretch()
+        lay.addLayout(row)
+        note = muted(QLabel("L'AUR se met à jour dans un terminal, car la compilation peut "
+                            "demander des choix. « Tout dans un terminal » est utile si une "
+                            "mise à jour bloque sur une question (conflit, remplacement)."))
+        note.setWordWrap(True)
+        lay.addWidget(note)
+
+        section(lay, "Autres")
+        lay.addWidget(ActionRow("network-server", "Classer les miroirs",
+                                "Teste la vitesse des miroirs et garde les plus rapides.",
+                                "Classer", self.rate_mirrors))
+        lay.addWidget(ActionRow("cpu", "Micrologiciels (BIOS, SSD, périphériques)",
+                                "Cherche et installe les mises à jour de firmware via fwupd.",
+                                "Vérifier", self.firmware))
+        lay.addStretch()
+        return w
+
+    def build_cleanup(self):
+        w, lay = page("Nettoyage", "Libère de l'espace sans toucher à tes données.")
+        self.r_cache = ActionRow("folder-download", "Cache des paquets",
+                                 "Garde les 2 dernières versions de chaque paquet (pour revenir "
+                                 "en arrière) et supprime celles des paquets désinstallés.",
+                                 "Nettoyer", self.clean_cache)
+        self.r_orph = ActionRow("edit-delete", "Paquets orphelins",
+                                "Dépendances qui ne servent plus à aucun programme.",
+                                "Supprimer", self.remove_orphans)
+        self.r_journal = ActionRow("text-x-log", "Journaux système",
+                                   "Ne garde que 2 semaines de journaux (500 Mo maximum).",
+                                   "Réduire", self.clean_journal)
+        self.r_thumbs = ActionRow("image-x-generic", "Miniatures",
+                                  "Aperçus d'images régénérés automatiquement à l'affichage.",
+                                  "Vider", self.clean_thumbs)
+        self.r_old = ActionRow("folder-temp", "Cache personnel ancien",
+                               "Fichiers de ~/.cache non lus depuis plus de 90 jours.",
+                               "Nettoyer", self.clean_old_cache)
+        self.r_aur = ActionRow("folder-build", "Cache de compilation AUR",
+                               "Sources téléchargées pour compiler les paquets AUR.",
+                               "Vider", self.clean_aur_cache)
+        self.r_flat = ActionRow("flatpak-discover", "Flatpak inutilisés",
+                                "Environnements d'exécution Flatpak qui ne servent plus.",
+                                "Supprimer", self.clean_flatpak)
+        for r in (self.r_cache, self.r_orph, self.r_journal, self.r_thumbs,
+                  self.r_old, self.r_aur, self.r_flat):
+            lay.addWidget(r)
+        self.r_flat.setVisible(have("flatpak"))
+        lay.addStretch()
+        return w
+
+    def build_diagnostic(self):
+        w, lay = page("Diagnostic", "Vérifie l'état du système. Ces contrôles ne modifient rien, "
+                                    "sauf mention contraire.")
+        rows = (
+            ("dialog-error", "Services en échec", "Liste les services systemd qui n'ont pas démarré.",
+             "Afficher", self.show_failed),
+            ("dialog-warning", "Erreurs depuis le démarrage", "Messages d'erreur du journal système.",
+             "Afficher", self.show_errors),
+            ("drive-harddisk", "Santé des disques (SMART)", "État de santé et usure des SSD et disques durs.",
+             "Analyser", self.smart),
+            ("drive-multidisk", "État Btrfs", "Occupation, compteurs d'erreurs et dernière vérification.",
+             "Afficher", self.btrfs_status),
+            ("package-x-generic", "Intégrité des paquets", "Cherche les fichiers manquants et les "
+             "dépendances cassées.", "Vérifier", self.verify_packages),
+            ("document-edit", "Fichiers .pacnew / .pacsave", "Nouvelles versions de fichiers de "
+             "configuration à fusionner après une mise à jour.", "Fusionner…", self.merge_pacnew),
+            ("view-sort-descending", "Paquets les plus volumineux", "Les 25 paquets qui prennent "
+             "le plus de place.", "Afficher", self.big_packages),
+            ("system-run", "Remettre à zéro les services en échec", "Efface l'état d'échec après "
+             "avoir corrigé le problème (administrateur).", "Réinitialiser", self.reset_failed),
+            ("object-unlocked", "Déverrouiller pacman", "Supprime un verrou laissé par une mise à "
+             "jour interrompue, si aucun pacman ne tourne (administrateur).", "Déverrouiller", self.unlock),
+        )
+        for r in rows:
+            lay.addWidget(ActionRow(*r))
+        lay.addStretch()
+        return w
+
+    def build_security(self):
+        w, lay = page("Sécurité", "Instantanés pour revenir en arrière et vérification "
+                                  "de l'intégrité des données.")
+        lay.addWidget(ActionRow("document-save", "Créer un instantané",
+                                "Photographie le système (snapper ou Timeshift) pour pouvoir "
+                                "revenir à cet état.", "Créer", self.snapshot))
+        lay.addWidget(ActionRow("view-list-details", "Liste des instantanés",
+                                "Affiche les instantanés existants.", "Afficher", self.snapshot_list))
+        lay.addWidget(ActionRow("security-medium", "Vérification Btrfs (scrub)",
+                                "Relit toutes les données pour détecter la corruption. Tourne en "
+                                "arrière-plan, le PC reste utilisable.", "Lancer", self.scrub))
+        if have("btrfs-assistant"):
+            lay.addWidget(ActionRow("btrfs-assistant", "Btrfs Assistant",
+                                    "Outil graphique CachyOS pour gérer les sous-volumes et snapper.",
+                                    "Ouvrir", lambda: QProcess.startDetached("btrfs-assistant-launcher"
+                                                                             if have("btrfs-assistant-launcher")
+                                                                             else "btrfs-assistant", [])))
+        lay.addStretch()
+        return w
+
+    def build_history(self):
+        w, lay = page("Historique", f"Journal des opérations : {LOG}")
+        self.history = QPlainTextEdit()
+        self.history.setReadOnly(True)
+        self.history.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        lay.addWidget(self.history, 1)
+        row = QHBoxLayout()
+        b1 = QPushButton(icon("view-refresh"), "Recharger")
+        b1.clicked.connect(self.load_history)
+        b2 = QPushButton(icon("document-open"), "Ouvrir le fichier")
+        b2.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG))))
+        row.addWidget(b1)
+        row.addWidget(b2)
+        row.addStretch()
+        lay.addLayout(row)
+        return w
+
+    def load_history(self):
+        try:
+            lines = LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-1500:]
+            self.history.setPlainText("\n".join(lines))
+            self.history.moveCursor(QTextCursor.MoveOperation.End)
+        except OSError:
+            self.history.setPlainText("Aucune opération enregistrée pour l'instant.")
+
+    # --------------------------------------------------------- collecte / affichage
+    def refresh(self):
+        if self.collector and self.collector.isRunning():
+            return
+        self.refresh_btn.setEnabled(False)
+        self.c_upd.set("…", "Recherche en cours…", "info")
+        self.upd_info.setText("Recherche des mises à jour…")
+        self.collector = Collector(self)
+        self.collector.partial.connect(self.on_data)
+        self.collector.finished.connect(lambda: self.refresh_btn.setEnabled(True))
+        self.collector.start()
+
+    def on_data(self, d: dict):
+        self.data.update(d)
+        if "os" in d:
+            self.show_quick(d)
+        if "updates" in d:
+            self.show_updates(d)
+
+    def show_quick(self, d):
+        self.dash_sub.setText(f"{d['os']} • {d['host']} • noyau {d['kernel']} • allumé depuis "
+                              f"{d['uptime']} • {d['pkgs']} paquets ({d['foreign']} AUR/externes)")
+        n = len(d["orphans"])
+        self.c_orph.set(str(n), ", ".join(d["orphans"][:6]) + ("…" if n > 6 else "") if n
+                        else "Rien à supprimer", "warn" if n else "ok", bool(n))
+        n = len(d["failed"])
+        self.c_fail.set(str(n), ", ".join(d["failed"][:4]) if n else "Tout fonctionne",
+                        "bad" if n else "ok", bool(n))
+        n = d["errors"]
+        self.c_err.set(str(n), "lignes d'erreur depuis le démarrage",
+                       "ok" if n == 0 else ("warn" if n < 50 else "bad"), bool(n))
+        n = len(d["pacnew"])
+        self.c_pacnew.set(str(n), "\n".join(Path(p).name for p in d["pacnew"][:3]) if n
+                          else "Configuration à jour", "warn" if n else "ok", bool(n))
+        size = d["pkgcache"] or 0
+        self.c_cache.set(human(size), "/var/cache/pacman/pkg",
+                         "warn" if size > 5 * 1024 ** 3 else "info", size > 0)
+        if d["reboot"]:
+            self.c_reboot.set("Conseillé", "Un nouveau noyau est installé.", "warn")
+        else:
+            self.c_reboot.set("Inutile", f"Noyau {d['kernel']} à jour.", "ok")
+        if d["last_run"]:
+            try:
+                days = (dt.date.today() - dt.date.fromisoformat(d["last_run"])).days
+            except ValueError:
+                days = 0
+            self.c_last.set(f"{days} j" if days else "Aujourd'hui", f"le {d['last_run']}",
+                            "ok" if days <= 14 else ("warn" if days <= 45 else "bad"))
+        else:
+            self.c_last.set("Jamais", "Lance une maintenance complète.", "warn")
+        if d["locked"]:
+            self.write("⚠ Verrou pacman présent : si aucune mise à jour ne tourne, "
+                       "utilise Diagnostic → Déverrouiller pacman.", "err")
+
+        # Espace disque
+        while self.disk_box.count():
+            item = self.disk_box.takeAt(0)
+            if item.layout():
+                while item.layout().count():
+                    sub = item.layout().takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
+            elif item.widget():
+                item.widget().deleteLater()
+        for mnt, fs, used, total in d["disks"]:
+            pct = int(used * 100 / total) if total else 0
+            row = QHBoxLayout()
+            name = QLabel(f"<b>{html.escape(mnt)}</b> <small>({fs})</small>")
+            name.setMinimumWidth(200)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(pct)
+            bar.setFormat(f"{pct} %")
+            col = RED if pct >= 90 else (ORANGE if pct >= 80 else GREEN)
+            bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {col}; }}")
+            info = QLabel(f"{human(used)} / {human(total)}")
+            info.setMinimumWidth(150)
+            info.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            row.addWidget(name)
+            row.addWidget(bar, 1)
+            row.addWidget(info)
+            self.disk_box.addLayout(row)
+
+        # Infos de la page Nettoyage
+        self.r_cache.info.setText(human(d["pkgcache"]))
+        self.r_orph.info.setText(f"{len(d['orphans'])} paquet(s)")
+        self.r_journal.info.setText(d["journal"])
+        self.r_thumbs.info.setText(human(d["thumbs"]))
+        self.r_old.info.setText(f"~/.cache : {human(d['usercache'])}")
+        self.r_aur.info.setText(human(d["aur_cache"]) if d["aur_cache_dir"] else "—")
+        self.r_aur.button.setEnabled(bool(d["aur_cache_dir"]))
+
+    def show_updates(self, d):
+        ups = d["updates"]
+        self.upd_tree.clear()
+        for name, old, new, src in ups:
+            it = QTreeWidgetItem([name, old, new, src])
+            it.setIcon(0, icon({"AUR": "package-x-generic", "Flatpak": "flatpak-discover"}
+                               .get(src, "package"), "package-x-generic"))
+            self.upd_tree.addTopLevelItem(it)
+        for i in (1, 2, 3):
+            self.upd_tree.resizeColumnToContents(i)
+        by = {s: sum(1 for u in ups if u[3] == s) for s in ("Dépôts", "AUR", "Flatpak")}
+        detail = " • ".join(f"{v} {k}" for k, v in by.items() if v) or "Système à jour"
+        if d["updates_error"]:
+            detail += f"\n⚠ {d['updates_error']}"
+        self.c_upd.set(str(len(ups)), detail,
+                       "bad" if d["updates_error"] and not ups else ("warn" if ups else "ok"),
+                       bool(by["Dépôts"] or by["Flatpak"]))
+        self.upd_info.setText(f"{len(ups)} mise(s) à jour disponible(s) — {detail}  "
+                              f"(vérifié à {dt.datetime.now():%H:%M})")
+
+    # --------------------------------------------------------------- console
+    def write(self, text: str, kind: str = "out"):
+        cur = self.console.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+        fmt = QTextCharFormat()
+        if kind != "out":
+            if not self._nl:
+                cur.insertText("\n")
+            fmt.setForeground(QColor({"ok": GREEN, "err": RED, "info": BLUE,
+                                      "title": BLUE}.get(kind, BLUE)))
+            if kind == "title":
+                fmt.setFontWeight(QFont.Weight.Bold)
+            text = text + "\n"
+        cur.insertText(text, fmt)
+        self._nl = text.endswith("\n")
+        self.console.setTextCursor(cur)
+        self.console.ensureCursorVisible()
+
+    def on_busy(self, busy: bool, label: str):
+        self.progress.setRange(0, 0 if busy else 1)
+        self.stop_btn.setEnabled(busy)
+        self.full_btn.setEnabled(not busy)
+        self.status.setText(label if busy else "Prêt.")
+
+    def on_done(self, ok: bool):
+        cb, self.after_done = self.after_done, None
+        if cb:
+            cb(ok)
+        self.refresh()
+
+    # ----------------------------------------------------------- exécution
+    def run(self, title: str, steps: list[Step], after=None) -> bool:
+        if any(s.root for s in steps) and not Path(HELPER).exists():
+            QMessageBox.warning(self, APP_NAME, "Le module administrateur n'est pas installé. "
+                                                "Lance install.sh.")
+            return False
+        if self.runner.busy():
+            QMessageBox.information(self, APP_NAME, "Une opération est déjà en cours.")
+            return False
+        self.after_done = after
+        return self.runner.start(title, steps)
+
+    def confirm(self, title: str, text: str) -> bool:
+        return QMessageBox.question(self, title, text) == QMessageBox.StandardButton.Yes
+
+    def in_terminal(self, title: str, command: str):
+        term = find_terminal()
+        if not term:
+            QMessageBox.warning(self, APP_NAME, "Aucun terminal trouvé (konsole, kitty…).")
+            return
+        script = (f'echo -e "\\e[1;36m━━━ {title} ━━━\\e[0m"; {command}; echo; '
+                  f'read -rp "Terminé. Appuie sur Entrée pour fermer…"')
+        p = QProcess(self)
+        p.finished.connect(lambda *_: (self.terminals.remove(p) if p in self.terminals else None,
+                                       self.refresh()))
+        self.terminals.append(p)
+        self.write(f"➜ {title} : ouvert dans un terminal", "info")
+        log_line(f"TERMINAL {command}")
+        p.start(term[0], term[1:] + ["bash", "-c", script])
+
+    # --------------------------------------------------------------- actions
+    def full_maintenance(self):
+        steps_txt = ["Instantané de sécurité (si snapper ou Timeshift)",
+                     "Mise à jour des dépôts officiels",
+                     "Suppression des paquets orphelins",
+                     "Nettoyage du cache des paquets",
+                     "Réduction des journaux système"]
+        steps = [Step("Maintenance système (administrateur)", ["full"], root=True)]
+        if have("flatpak"):
+            steps_txt.append("Mise à jour et nettoyage des Flatpak")
+            steps += [Step("Mise à jour Flatpak", ["flatpak", "update", "-y", "--noninteractive"],
+                           stop_on_fail=False),
+                      Step("Flatpak inutilisés", ["flatpak", "uninstall", "--unused", "-y",
+                                                  "--noninteractive"], stop_on_fail=False)]
+        if not self.confirm("Maintenance complète",
+                            "Étapes prévues :\n\n• " + "\n• ".join(steps_txt) +
+                            "\n\nTon mot de passe sera demandé. Continuer ?"):
+            return
+        self.run("Maintenance complète", steps, after=self._after_full)
+
+    def _after_full(self, ok: bool):
+        if not ok:
+            self.write("La maintenance ne s'est pas terminée correctement : consulte la console "
+                       "ci-dessus. Tu peux réessayer avec « Tout dans un terminal ».", "err")
+            return
+        LAST_RUN.write_text(dt.date.today().isoformat())
+        self.write("✔ Maintenance complète terminée.", "ok")
+        aur = [u for u in self.data.get("updates", []) if u[3] == "AUR"]
+        if aur and self.confirm("AUR", f"{len(aur)} paquet(s) AUR peuvent être mis à jour.\n"
+                                       "Les mettre à jour maintenant dans un terminal ?"):
+            self.update_aur()
+        if not Path(f"/usr/lib/modules/{platform.release()}").exists():
+            QMessageBox.information(self, APP_NAME, "Un nouveau noyau a été installé.\n"
+                                                    "Redémarre l'ordinateur pour l'utiliser.")
+
+    def update_system(self):
+        steps = [Step("Mise à jour des dépôts", ["update"], root=True)]
+        if have("flatpak"):
+            steps.append(Step("Mise à jour Flatpak", ["flatpak", "update", "-y", "--noninteractive"],
+                              stop_on_fail=False))
+        self.run("Mise à jour du système", steps)
+
+    def update_aur(self):
+        h = aur_helper()
+        if not h:
+            QMessageBox.information(self, APP_NAME, "Aucun assistant AUR (paru ou yay) installé.")
+            return
+        self.in_terminal("Mise à jour AUR", f"{h} -Sua")
+
+    def update_terminal(self):
+        h = aur_helper()
+        cmd = f"{h} -Syu" if h else "sudo pacman -Syu"
+        if have("flatpak"):
+            cmd += " && flatpak update"
+        self.in_terminal("Mise à jour complète", cmd)
+
+    def rate_mirrors(self):
+        self.run("Classement des miroirs", [Step("Test des miroirs (1 à 2 minutes)", ["mirrors"], root=True)])
+
+    def firmware(self):
+        if not have("fwupdmgr"):
+            QMessageBox.information(self, APP_NAME, "fwupd n'est pas installé :\nsudo pacman -S fwupd")
+            return
+        self.run("Micrologiciels", [
+            Step("Actualisation des métadonnées", ["fwupdmgr", "refresh", "--force"], stop_on_fail=False),
+            Step("Recherche de mises à jour", ["fwupdmgr", "get-updates"], ok_codes=(0, 2)),
+        ], after=self._firmware_after)
+
+    def _firmware_after(self, ok):
+        if ok and self.confirm("Micrologiciels", "Si des mises à jour sont listées dans la console, "
+                                                 "les installer maintenant ?"):
+            QTimer.singleShot(0, lambda: self.run("Installation des micrologiciels", [
+                Step("Installation", ["fwupdmgr", "update", "-y", "--no-reboot-check"], ok_codes=(0, 2))]))
+
+    def clean_cache(self):
+        self.run("Nettoyage du cache des paquets", [Step("paccache", ["clean-cache"], root=True)])
+
+    def remove_orphans(self):
+        orph = self.data.get("orphans", [])
+        if not orph:
+            QMessageBox.information(self, APP_NAME, "Aucun paquet orphelin.")
+            return
+        if self.confirm("Paquets orphelins", f"Supprimer ces {len(orph)} paquet(s) ?\n\n" +
+                        ", ".join(orph[:40]) + ("…" if len(orph) > 40 else "")):
+            self.run("Suppression des orphelins", [Step("pacman -Rns", ["orphans"], root=True)])
+
+    def clean_journal(self):
+        self.run("Réduction des journaux", [Step("journalctl --vacuum", ["journal"], root=True)])
+
+    def clean_thumbs(self):
+        t = HOME_CACHE / "thumbnails"
+        if not t.is_dir():
+            QMessageBox.information(self, APP_NAME, "Pas de miniatures à supprimer.")
+            return
+        self.run("Miniatures", [Step("Suppression des miniatures",
+                                     ["find", str(t), "-type", "f", "-delete"])])
+
+    def clean_old_cache(self):
+        if self.confirm("Cache personnel", "Supprimer les fichiers de ~/.cache non lus depuis "
+                                           "plus de 90 jours ?\nLes applications les recréeront "
+                                           "si nécessaire."):
+            self.run("Cache personnel ancien", [
+                Step("Fichiers anciens", ["find", str(HOME_CACHE), "-xdev", "-type", "f",
+                                          "-atime", "+90", "-print", "-delete"], stop_on_fail=False,
+                     ok_codes=(0, 1)),
+                Step("Dossiers vides", ["find", str(HOME_CACHE), "-xdev", "-mindepth", "1",
+                                        "-type", "d", "-empty", "-delete"], ok_codes=(0, 1))])
+
+    def clean_aur_cache(self):
+        d = self.data.get("aur_cache_dir")
+        if d and self.confirm("Cache AUR", f"Vider {d} ?\nLes sources seront retéléchargées "
+                                           "à la prochaine mise à jour AUR."):
+            self.run("Cache AUR", [Step("Suppression", ["bash", "-c",
+                                                        'shopt -s dotglob nullglob; rm -rf -- "$1"/*',
+                                                        "_", str(d)])])
+
+    def clean_flatpak(self):
+        self.run("Flatpak inutilisés", [Step("flatpak uninstall --unused",
+                                             ["flatpak", "uninstall", "--unused", "-y", "--noninteractive"])])
+
+    def show_failed(self):
+        self.run("Services en échec", [
+            Step("Services système", ["systemctl", "--failed", "--no-pager"]),
+            Step("Services utilisateur", ["systemctl", "--user", "--failed", "--no-pager"])])
+
+    def show_errors(self):
+        self.run("Erreurs du journal", [Step("Erreurs depuis le démarrage (100 dernières)",
+                                             ["journalctl", "-b", "-p", "3", "-q", "--no-pager",
+                                              "-n", "100"])])
+
+    def smart(self):
+        self.run("Santé des disques", [Step("smartctl", ["smart"], root=True)])
+
+    def btrfs_status(self):
+        self.run("État Btrfs", [Step("btrfs", ["btrfs"], root=True)])
+
+    def verify_packages(self):
+        self.run("Intégrité des paquets", [
+            Step("Fichiers manquants", ["bash", "-c",
+                                        "pacman -Qk 2>/dev/null | grep -v ' 0 missing files' "
+                                        "|| echo 'Aucun fichier manquant.'"]),
+            Step("Dépendances", ["pacman", "-Dk"], stop_on_fail=False)])
+
+    def merge_pacnew(self):
+        if not have("pacdiff"):
+            QMessageBox.information(self, APP_NAME, "pacdiff absent : sudo pacman -S pacman-contrib")
+            return
+        files = self.data.get("pacnew", [])
+        if not files:
+            QMessageBox.information(self, APP_NAME, "Aucun fichier .pacnew ou .pacsave.")
+            return
+        diff = "meld" if have("meld") else ("kompare" if have("kompare") else "vimdiff")
+        self.in_terminal("Fusion des fichiers de configuration",
+                         f"sudo DIFFPROG={diff} pacdiff")
+
+    def big_packages(self):
+        script = ("LC_ALL=C pacman -Qi | awk -F': ' '/^Name/{n=$2} /^Installed Size/{split($2,a,\" \");"
+                  "m=(a[2]==\"KiB\")?1/1024:(a[2]==\"GiB\")?1024:(a[2]==\"B\")?1/1048576:1;"
+                  "printf \"%9.1f Mo  %s\\n\", a[1]*m, n}' | sort -rn | head -25")
+        self.run("Paquets les plus volumineux", [Step("pacman -Qi", ["bash", "-c", script])])
+
+    def reset_failed(self):
+        self.run("Services", [Step("systemctl reset-failed", ["reset-failed"], root=True)])
+
+    def unlock(self):
+        if self.confirm("Déverrouiller pacman", "Supprimer le verrou de pacman ?\n"
+                                                "(refusé automatiquement si une mise à jour tourne)"):
+            self.run("Verrou pacman", [Step("Déverrouillage", ["unlock"], root=True)])
+
+    def snapshot(self):
+        self.run("Instantané", [Step("Création", ["snapshot"], root=True)])
+
+    def snapshot_list(self):
+        self.run("Instantanés", [Step("Liste", ["snapshot-list"], root=True)])
+
+    def scrub(self):
+        if self.confirm("Vérification Btrfs", "Lancer la vérification complète du disque système ?\n"
+                                              "Elle dure de quelques minutes à une heure selon "
+                                              "la taille et tourne en arrière-plan."):
+            self.run("Scrub Btrfs", [Step("btrfs scrub start", ["scrub"], root=True)])
+
+    def closeEvent(self, e):
+        if self.runner.busy() and not self.confirm(APP_NAME, "Une opération est en cours. "
+                                                             "Quitter quand même ?"):
+            e.ignore()
+            return
+        e.accept()
+
+
+def main():
+    if os.geteuid() == 0:
+        print("Lance Cachy Maint en utilisateur normal : il demandera le mot de passe au besoin.")
+        sys.exit(1)
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(VERSION)
+    app.setDesktopFileName("cachy-maint")
+    if not have("pacman"):
+        QMessageBox.critical(None, APP_NAME, "pacman introuvable : Cachy Maint est prévu pour "
+                                             "CachyOS / Arch Linux.")
+        sys.exit(1)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

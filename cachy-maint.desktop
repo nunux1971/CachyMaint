@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Cachy Maint
+GenericName=Maintenance du système
+Comment=Mettre à jour, nettoyer et vérifier CachyOS
+Exec=cachy-maint-gui
+Icon=system-software-update
+Terminal=false
+Categories=System;Settings;Qt;
+Keywords=update;maintenance;pacman;cachyos;nettoyage;mise à jour;
+StartupWMClass=cachy-maint

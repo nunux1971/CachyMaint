@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  cachy-maint-helper — actions administrateur de Cachy Maint
+#  Appelé uniquement via pkexec. N'accepte qu'une liste fermée d'actions,
+#  sans argument libre, pour qu'il ne puisse pas servir à autre chose.
+#  Installé dans /usr/local/libexec (propriété de root, non modifiable).
+# =============================================================================
+set -o pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/bin
+export LC_ALL="${LC_ALL:-C.UTF-8}"
+
+[[ $EUID -eq 0 ]] || { echo "Ce programme doit être lancé via pkexec."; exit 1; }
+
+PAC=(stdbuf -oL -eL pacman --color never)
+say()  { printf '%s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+check_lock() {
+  if [[ -e /var/lib/pacman/db.lck ]]; then
+    if pgrep '^(pacman|paru|yay|pamac)$' >/dev/null; then
+      say "✘ Un gestionnaire de paquets est déjà en cours d'exécution."; exit 3
+    fi
+    say "✘ Verrou pacman présent (/var/lib/pacman/db.lck)."
+    say "  Aucun pacman ne tourne : utilise « Déverrouiller pacman » dans Diagnostic."
+    exit 3
+  fi
+}
+
+keyring() {
+  local k=(archlinux-keyring)
+  pacman -Si cachyos-keyring >/dev/null 2>&1 && k+=(cachyos-keyring)
+  say "• Actualisation des bases et des trousseaux de clés…"
+  "${PAC[@]}" -Sy --needed --noconfirm "${k[@]}"
+}
+
+do_update() {
+  check_lock
+  keyring || { say "✘ Impossible d'actualiser les bases de paquets."; return 1; }
+  say "• Mise à jour des paquets…"
+  "${PAC[@]}" -Su --noconfirm
+}
+
+do_orphans() {
+  mapfile -t o < <(pacman -Qdtq 2>/dev/null)
+  if (( ${#o[@]} == 0 )); then say "✔ Aucun paquet orphelin."; return 0; fi
+  say "• Suppression de ${#o[@]} paquet(s) orphelin(s) : ${o[*]}"
+  "${PAC[@]}" -Rns --noconfirm "${o[@]}"
+}
+
+do_cache() {
+  have paccache || { say "✘ paccache absent : installe pacman-contrib."; return 1; }
+  say "• Cache : conservation des 2 dernières versions"
+  paccache -rk2
+  say "• Cache : suppression des paquets désinstallés"
+  paccache -ruk0
+}
+
+do_journal() {
+  say "• Journaux : 2 semaines et 500 Mo maximum"
+  journalctl --vacuum-time=2weeks --vacuum-size=500M
+}
+
+do_snapshot() {
+  local d="Cachy Maint $(date '+%F %H:%M')"
+  if have snapper && snapper -c root get-config >/dev/null 2>&1; then
+    snapper -c root create -d "$d" --cleanup-algorithm number && say "✔ Instantané snapper créé : $d"
+  elif have timeshift; then
+    timeshift --create --comments "$d" && say "✔ Instantané Timeshift créé : $d"
+  else
+    say "ℹ Ni snapper (configuré) ni timeshift : aucun instantané créé."
+    return 2
+  fi
+}
+
+case "${1:-}" in
+  full)
+    check_lock
+    do_snapshot || true
+    do_update   || { say "✘ Mise à jour échouée : arrêt de la maintenance."; exit 1; }
+    do_orphans; do_cache; do_journal
+    say "✔ Maintenance administrateur terminée." ;;
+  update)        do_update ;;
+  orphans)       check_lock; do_orphans ;;
+  clean-cache)   do_cache ;;
+  journal)       do_journal ;;
+  snapshot)      do_snapshot ;;
+  snapshot-list)
+    if have snapper; then snapper -c root list
+    elif have timeshift; then timeshift --list
+    else say "Ni snapper ni timeshift installé."; fi ;;
+  mirrors)
+    if   have cachyos-rate-mirrors; then cachyos-rate-mirrors
+    elif have reflector; then reflector --latest 20 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+    else say "✘ Ni cachyos-rate-mirrors ni reflector installé."; exit 1; fi ;;
+  smart)
+    have smartctl || { say "✘ smartctl absent : installe smartmontools."; exit 1; }
+    while read -r dev; do
+      say "── /dev/$dev"
+      smartctl -H -A "/dev/$dev" | grep -Ei 'overall-health|health status|Reallocated_Sector|Pending_Sector|Uncorrectable|Percentage Used|Media and Data Integrity|Power_On_Hours|Power On Hours|Temperature' \
+        || say "   SMART non disponible"
+    done < <(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}')
+    ;;
+  btrfs)
+    findmnt -t btrfs / >/dev/null || { say "La racine n'est pas en Btrfs."; exit 0; }
+    btrfs filesystem usage -T /; echo
+    say "── Compteurs d'erreurs"; btrfs device stats /; echo
+    say "── Dernière vérification (scrub)"; btrfs scrub status / ;;
+  scrub)
+    findmnt -t btrfs / >/dev/null || { say "La racine n'est pas en Btrfs."; exit 0; }
+    btrfs scrub start / && say "✔ Vérification lancée en arrière-plan. Résultat via « État Btrfs »." ;;
+  reset-failed)  systemctl reset-failed && say "✔ Compteurs d'échec des services remis à zéro." ;;
+  unlock)
+    if pgrep '^(pacman|paru|yay|pamac)$' >/dev/null; then say "✘ Un gestionnaire de paquets tourne : verrou conservé."; exit 1; fi
+    if [[ -e /var/lib/pacman/db.lck ]]; then rm -f /var/lib/pacman/db.lck && say "✔ Verrou supprimé."
+    else say "✔ Aucun verrou présent."; fi ;;
+  *) say "Action inconnue : ${1:-}"; exit 2 ;;
+esac
