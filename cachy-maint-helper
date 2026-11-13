@@ -15,6 +15,8 @@ PAC=(stdbuf -oL -eL pacman --color never)
 say()  { printf '%s\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+list_disks() { lsblk -dno NAME,TYPE | awk '$2=="disk" && $1 !~ /^(zram|loop|ram)/ {print $1}'; }
+
 check_lock() {
   if [[ -e /var/lib/pacman/db.lck ]]; then
     if pgrep '^(pacman|paru|yay|pamac)$' >/dev/null; then
@@ -98,8 +100,24 @@ case "${1:-}" in
       say "── /dev/$dev"
       smartctl -H -A "/dev/$dev" | grep -Ei 'overall-health|health status|Reallocated_Sector|Pending_Sector|Uncorrectable|Percentage Used|Media and Data Integrity|Power_On_Hours|Power On Hours|Temperature' \
         || say "   SMART non disponible"
-    done < <(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}')
+    done < <(list_disks)
     ;;
+  smart-json)
+    have smartctl || { say "✘ smartctl absent : installe smartmontools."; exit 1; }
+    while read -r dev; do
+      echo "@@@ /dev/$dev"
+      smartctl -j -a "/dev/$dev"
+      echo
+    done < <(list_disks)
+    ;;
+  smart-test)
+    have smartctl || { say "✘ smartctl absent : installe smartmontools."; exit 1; }
+    while read -r dev; do
+      say "── /dev/$dev"
+      smartctl -t short "/dev/$dev" | grep -Ei 'has begun|please wait|not supported|aborted|in progress' \
+        | sed 's/^/   /' || say "   Auto-test non pris en charge."
+    done < <(list_disks)
+    say "Résultat dans quelques minutes : relance l'analyse." ;;
   btrfs)
     findmnt -t btrfs / >/dev/null || { say "La racine n'est pas en Btrfs."; exit 0; }
     btrfs filesystem usage -T /; echo

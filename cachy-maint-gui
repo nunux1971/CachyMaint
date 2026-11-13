@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFr
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 APP_NAME = "Cachy Maint"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 HELPER = "/usr/local/libexec/cachy-maint-helper"
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "cachy-maint"
 LOG = STATE / "maintenance.log"
@@ -578,6 +578,178 @@ def hardware_report(sections) -> str:
     return "\n".join(out)
 
 
+# =============================================================================
+#  Santé des disques (smartctl -j, via le helper)
+# =============================================================================
+SMART_CACHE = STATE / "smart.json"
+
+# Attributs ATA dont la valeur normalisée = % de vie restante (selon les fabricants)
+ATA_LIFE_ATTRS = (231, 202, 169, 177, 233, 173)
+
+
+def _ata_attrs(j: dict) -> dict[int, dict]:
+    return {a.get("id"): a for a in j.get("ata_smart_attributes", {}).get("table", [])}
+
+
+def _raw(a: dict | None) -> int:
+    try:
+        return int((a or {}).get("raw", {}).get("value", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def fmt_hours(h: int) -> str:
+    if h < 48:
+        return f"{h} h"
+    y, d = divmod(h / 24, 365)
+    return f"{h:,} h (≈ {y:.0f} an{'s' if y >= 2 else ''} {d:.0f} j)".replace(",", " ") if y \
+        else f"{h:,} h (≈ {d:.0f} jours)".replace(",", " ")
+
+
+def fmt_tb(n: float) -> str:
+    return f"{n / 1e12:.2f} To" if n >= 1e12 else f"{n / 1e9:.0f} Go"
+
+
+def analyze_smart(dev: str, j: dict) -> dict:
+    """Résume la sortie JSON de smartctl en verdict + lignes lisibles."""
+    r = {"dev": dev, "model": j.get("model_name") or j.get("model_family") or "Disque",
+         "capacity": (j.get("user_capacity") or {}).get("bytes") or j.get("nvme_total_capacity"),
+         "health": None, "level": "ok", "reasons": [], "rows": []}
+    proto = (j.get("device") or {}).get("protocol", "")
+    if not j or "smart_status" not in j and proto != "NVMe" and not j.get("ata_smart_attributes"):
+        msgs = [m.get("string", "") for m in (j.get("smartctl") or {}).get("messages", [])]
+        r.update(kind="?", level="info", verdict="SMART non disponible",
+                 reasons=[m for m in msgs if m][:2] or ["Ce périphérique ne fournit pas de données SMART "
+                                                        "(clé USB, disque virtuel, adaptateur…)."])
+        return r
+    rot = j.get("rotation_rate", 0)
+    r["kind"] = "NVMe" if proto == "NVMe" else ("HDD" if isinstance(rot, int) and rot > 0 else "SSD")
+    rows, reasons = r["rows"], r["reasons"]
+    bad = warn = False
+
+    passed = (j.get("smart_status") or {}).get("passed")
+    if passed is False:
+        bad = True
+        reasons.append("Le disque signale lui-même une défaillance SMART.")
+    temp = (j.get("temperature") or {}).get("current")
+    hours = (j.get("power_on_time") or {}).get("hours")
+
+    if proto == "NVMe":
+        n = j.get("nvme_smart_health_information_log", {})
+        used = n.get("percentage_used")
+        if used is not None:
+            r["health"] = max(0, 100 - int(used))
+        spare, thr = n.get("available_spare"), n.get("available_spare_threshold")
+        if spare is not None:
+            rows.append(("Réserve disponible", f"{spare} % (seuil {thr} %)"))
+            if thr is not None and spare <= thr:
+                bad = True
+                reasons.append("Réserve de cellules sous le seuil critique.")
+            elif spare < 50:
+                warn = True
+                reasons.append("Réserve de cellules entamée.")
+        written = n.get("data_units_written", 0) * 512000
+        read_ = n.get("data_units_read", 0) * 512000
+        rows.append(("Données écrites", fmt_tb(written)))
+        rows.append(("Données lues", fmt_tb(read_)))
+        if n.get("critical_warning"):
+            bad = True
+            reasons.append(f"Avertissement critique du contrôleur (code {n['critical_warning']}).")
+        me = n.get("media_errors", 0)
+        rows.append(("Erreurs de données", str(me)))
+        if me:
+            warn = True
+            reasons.append(f"{me} erreur(s) d'intégrité des données.")
+        rows.append(("Arrêts brutaux", str(n.get("unsafe_shutdowns", 0))))
+        hours = hours or n.get("power_on_hours")
+        temp = temp or n.get("temperature")
+    else:
+        attrs = _ata_attrs(j)
+        if r["kind"] == "SSD":
+            for i in ATA_LIFE_ATTRS:
+                if i in attrs and attrs[i].get("value") is not None:
+                    r["health"] = max(0, min(100, int(attrs[i]["value"])))
+                    break
+        for a in attrs.values():
+            name = a.get("name", "")
+            if re.search(r"(Total_LBAs_Written|Host_Writes|Lifetime_Writes|NAND_Writes)", name):
+                raw = _raw(a)
+                unit = (2 ** 30 if "GiB" in name else 32 * 2 ** 20 if "32MiB" in name
+                        else j.get("logical_block_size", 512))
+                rows.append(("Données écrites", fmt_tb(raw * unit)))
+                break
+        for aid, label, severe in ((5, "Secteurs réalloués", False), (197, "Secteurs en attente", True),
+                                   (198, "Secteurs illisibles", True), (199, "Erreurs de câble (CRC)", False)):
+            if aid in attrs:
+                v = _raw(attrs[aid])
+                rows.append((label, str(v)))
+                if v:
+                    if severe or (aid == 5 and v > 50):
+                        bad = True
+                    else:
+                        warn = True
+                    reasons.append(f"{label} : {v}" + (" — vérifie le câble SATA." if aid == 199 else "."))
+        for a in attrs.values():
+            if a.get("thresh") and a.get("value") is not None and a["value"] <= a["thresh"]:
+                bad = True
+                reasons.append(f"Attribut {a.get('name')} sous son seuil de défaillance.")
+
+    h = r["health"]
+    if h is not None:
+        if h <= 10:
+            bad = True
+            reasons.append(f"Usure très avancée : {h} % de vie restante.")
+        elif h <= 30:
+            warn = True
+            reasons.append(f"Usure avancée : {h} % de vie restante.")
+    if temp:
+        rows.insert(0, ("Température", f"{temp} °C"))
+        if temp >= 70:
+            warn = True
+            reasons.append(f"Température élevée ({temp} °C) : vérifie la ventilation / le dissipateur.")
+    if hours is not None:
+        rows.insert(0, ("Heures de fonctionnement", fmt_hours(int(hours))))
+    if j.get("power_cycle_count") is not None:
+        rows.insert(1, ("Démarrages", str(j["power_cycle_count"])))
+
+    test = None
+    if proto == "NVMe":
+        t = (j.get("nvme_self_test_log") or {}).get("table") or []
+        if t:
+            test = (t[0].get("self_test_result") or {}).get("string")
+    else:
+        t = ((j.get("ata_smart_self_test_log") or {}).get("standard") or {}).get("table") or []
+        if t:
+            test = (t[0].get("status") or {}).get("string")
+    if test:
+        rows.append(("Dernier auto-test", test))
+        if re.search(r"fail", test, re.I):
+            bad = True
+            reasons.append(f"Le dernier auto-test a échoué : {test}")
+    if j.get("firmware_version"):
+        rows.append(("Firmware", j["firmware_version"]))
+
+    r["level"] = "bad" if bad else ("warn" if warn else "ok")
+    r["verdict"] = {"bad": "Critique — sauvegarde tes données", "warn": "À surveiller",
+                    "ok": "Bon état"}[r["level"]]
+    if not reasons:
+        reasons.append("Aucun signe d'usure anormale ni d'erreur.")
+    return r
+
+
+def parse_smart_output(text: str) -> list[dict]:
+    import json
+    disks = []
+    for block in text.split("@@@ ")[1:]:
+        dev, _, js = block.partition("\n")
+        try:
+            j = json.loads(js.strip() or "{}")
+        except ValueError:
+            j = {}
+        disks.append(analyze_smart(dev.strip(), j))
+    return disks
+
+
 class HardwareCollector(QThread):
     ready = Signal(list)
 
@@ -842,6 +1014,7 @@ class MainWindow(QMainWindow):
             ("Nettoyage", "edit-clear-all", self.build_cleanup),
             ("Diagnostic", "dialog-information", self.build_diagnostic),
             ("Matériel", "preferences-devices-tree", self.build_hardware),
+            ("Santé des disques", "drive-harddisk", self.build_disks),
             ("Sécurité", "security-high", self.build_security),
             ("Historique", "view-history", self.build_history),
         ):
@@ -938,6 +1111,12 @@ class MainWindow(QMainWindow):
         section(lay, "Espace disque")
         self.disk_box = QVBoxLayout()
         lay.addLayout(self.disk_box)
+        self.dash_smart = QLabel("<b>Santé des disques :</b> pas encore analysée — "
+                                 "<a href='#'>analyser</a>")
+        self.dash_smart.linkActivated.connect(lambda _: self.goto("Santé des disques"))
+        self.dash_smart.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dash_smart.mousePressEvent = lambda _e: self.goto("Santé des disques")
+        lay.addWidget(self.dash_smart)
         lay.addStretch()
         return w
 
@@ -1019,8 +1198,8 @@ class MainWindow(QMainWindow):
              "Afficher", self.show_failed),
             ("dialog-warning", "Erreurs depuis le démarrage", "Messages d'erreur du journal système.",
              "Afficher", self.show_errors),
-            ("drive-harddisk", "Santé des disques (SMART)", "État de santé et usure des SSD et disques durs.",
-             "Analyser", self.smart),
+            ("drive-harddisk", "Santé des disques (SMART)", "Usure des SSD, erreurs et verdict par disque.",
+             "Ouvrir", self.smart),
             ("drive-multidisk", "État Btrfs", "Occupation, compteurs d'erreurs et dernière vérification.",
              "Afficher", self.btrfs_status),
             ("package-x-generic", "Intégrité des paquets", "Cherche les fichiers manquants et les "
@@ -1101,6 +1280,152 @@ class MainWindow(QMainWindow):
         self.sensor_timer.setInterval(3000)
         self.sensor_timer.timeout.connect(self.update_sensors)
         return w
+
+    # ------------------------------------------------------- santé des disques
+    def build_disks(self):
+        w, lay = page("Santé des disques", "Usure et fiabilité des SSD et disques durs, d'après "
+                                           "les données SMART. L'analyse demande ton mot de passe.")
+        row = QHBoxLayout()
+        self.smart_btn = QPushButton(icon("view-refresh"), "Analyser les disques")
+        self.smart_btn.clicked.connect(self.analyze_disks)
+        row.addWidget(self.smart_btn)
+        b = QPushButton(icon("system-run"), "Lancer un auto-test rapide")
+        b.setToolTip("Le disque se teste lui-même (1 à 2 minutes), sans gêner l'utilisation.")
+        b.clicked.connect(lambda: self.run("Auto-test SMART", [Step("smartctl -t short", ["smart-test"],
+                                                                    root=True)]))
+        row.addWidget(b)
+        row.addStretch()
+        lay.addLayout(row)
+        self.smart_info = muted(QLabel(""))
+        lay.addWidget(self.smart_info)
+        self.smart_grid = QGridLayout()
+        self.smart_grid.setSpacing(12)
+        lay.addLayout(self.smart_grid)
+        legend = muted(QLabel(
+            "<b>Vie restante</b> : estimation du fabricant selon l'usure des cellules (100 % = neuf). "
+            "Un SSD reste généralement fiable bien en dessous de 100 %, mais au-dessous de 10 % "
+            "ou en cas d'erreurs, sauvegarde tes données et prévois son remplacement."))
+        legend.setWordWrap(True)
+        lay.addWidget(legend)
+        lay.addStretch()
+        self._smart_proc: QProcess | None = None
+        self.smart_disks: list = []
+        self.smart_date = ""
+        self.load_smart_cache()
+        return w
+
+    def load_smart_cache(self):
+        import json
+        try:
+            c = json.loads(SMART_CACHE.read_text())
+            self.show_disks(c["disks"], c["date"])
+        except (OSError, ValueError, KeyError):
+            self.smart_info.setText("Aucune analyse pour l'instant : clique sur « Analyser les disques ».")
+
+    def analyze_disks(self):
+        if not Path(HELPER).exists():
+            QMessageBox.warning(self, APP_NAME, "Le module administrateur n'est pas installé. "
+                                                "Lance install.sh.")
+            return
+        if self._smart_proc:
+            return
+        self.smart_btn.setEnabled(False)
+        self.smart_info.setText("Analyse en cours…")
+        p = QProcess(self)
+        p.finished.connect(self._smart_done)
+        self._smart_proc = p
+        p.start("pkexec", [HELPER, "smart-json"])
+
+    def _smart_done(self, code: int, _status):
+        import json
+        p, self._smart_proc = self._smart_proc, None
+        self.smart_btn.setEnabled(True)
+        out = bytes(p.readAllStandardOutput()).decode("utf-8", "replace")
+        p.deleteLater()
+        if code in (126, 127):
+            self.smart_info.setText("Analyse annulée (authentification refusée).")
+            return
+        if "@@@" not in out:
+            self.smart_info.setText("Analyse impossible : " + (out.strip()[:200] or f"code {code}"))
+            return
+        disks = parse_smart_output(out)
+        date = f"{dt.datetime.now():%d/%m/%Y à %H:%M}"
+        try:
+            SMART_CACHE.write_text(json.dumps({"date": date, "disks": disks}))
+        except OSError:
+            pass
+        self.show_disks(disks, date)
+        for d in disks:
+            log_line(f"SMART {d['dev']} {d['model']} : {d['verdict']} (vie {d['health']})")
+
+    def show_disks(self, disks: list, date: str):
+        self.smart_disks, self.smart_date = disks, date
+        while self.smart_grid.count():
+            it = self.smart_grid.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        for i, d in enumerate(disks):
+            self.smart_grid.addWidget(self.disk_card(d), i // 2, i % 2)
+        self.smart_info.setText(f"Dernière analyse : {date} — {len(disks)} disque(s).")
+        self.update_dash_smart()
+
+    def disk_card(self, d: dict) -> QFrame:
+        col = {"ok": GREEN, "warn": ORANGE, "bad": RED}.get(d["level"], BLUE)
+        f = QFrame()
+        f.setFrameShape(QFrame.Shape.StyledPanel)
+        f.setStyleSheet(f"QFrame#disk {{ border-left: 4px solid {col}; }}")
+        f.setObjectName("disk")
+        v = QVBoxLayout(f)
+        head = QHBoxLayout()
+        ic = QLabel()
+        ic.setPixmap(icon("drive-harddisk-solidstate" if d.get("kind") in ("SSD", "NVMe")
+                          else "drive-harddisk", "drive-harddisk").pixmap(36, 36))
+        head.addWidget(ic)
+        cap = human(d["capacity"]) if d.get("capacity") else ""
+        head.addWidget(QLabel(f"<b>{html.escape(d['model'])}</b><br><small>{d['dev']} • "
+                              f"{d.get('kind', '?')}{' • ' + cap if cap else ''}</small>"), 1)
+        verdict = QLabel(html.escape(d["verdict"]))
+        verdict.setStyleSheet(f"color:{col}; font-weight:bold")
+        head.addWidget(verdict)
+        v.addLayout(head)
+
+        if d.get("health") is not None:
+            hrow = QHBoxLayout()
+            hrow.addWidget(QLabel("Vie restante"))
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(d["health"])
+            bar.setFormat(f"{d['health']} %")
+            hcol = RED if d["health"] <= 10 else ORANGE if d["health"] <= 30 else GREEN
+            bar.setStyleSheet(f"QProgressBar::chunk {{ background-color: {hcol}; }}")
+            hrow.addWidget(bar, 1)
+            v.addLayout(hrow)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(16)
+        for i, (k, val) in enumerate(d["rows"]):
+            grid.addWidget(muted(QLabel(k)), i, 0)
+            grid.addWidget(QLabel(html.escape(str(val))), i, 1)
+        grid.setColumnStretch(1, 1)
+        v.addLayout(grid)
+        reasons = QLabel("<br>".join("• " + html.escape(x) for x in d["reasons"]))
+        reasons.setWordWrap(True)
+        if d["level"] in ("warn", "bad"):
+            reasons.setStyleSheet(f"color:{col}")
+        v.addWidget(reasons)
+        return f
+
+    def update_dash_smart(self):
+        if not hasattr(self, "dash_smart") or not self.smart_disks:
+            return
+        worst = max(self.smart_disks, key=lambda d: {"ok": 0, "info": 0, "warn": 1, "bad": 2}[d["level"]])
+        level = worst["level"]
+        col = {"ok": GREEN, "warn": ORANGE, "bad": RED}.get(level, BLUE)
+        txt = {"ok": "✔ tous les disques sont en bon état", "info": "✔ aucun problème détecté",
+               "warn": f"⚠ {worst['model']} est à surveiller",
+               "bad": f"✘ {worst['model']} : état critique, sauvegarde tes données !"}[level]
+        self.dash_smart.setText(f"<b>Santé des disques :</b> <span style='color:{col}'>"
+                                f"{html.escape(txt)}</span> <small>(analyse du {self.smart_date})</small>")
 
     def on_page(self, i: int):
         name = self.nav.item(i).text() if self.nav.item(i) else ""
@@ -1508,7 +1833,15 @@ class MainWindow(QMainWindow):
                                               "-n", "100"])])
 
     def smart(self):
-        self.run("Santé des disques", [Step("smartctl", ["smart"], root=True)])
+        self.goto("Santé des disques")
+        if not self.smart_disks:
+            self.analyze_disks()
+
+    def goto(self, name: str):
+        for i in range(self.nav.count()):
+            if self.nav.item(i).text() == name:
+                self.nav.setCurrentRow(i)
+                return
 
     def btrfs_status(self):
         self.run("État Btrfs", [Step("btrfs", ["btrfs"], root=True)])

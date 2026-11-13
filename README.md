@@ -11,6 +11,7 @@ Application graphique de maintenance pour **CachyOS** (et Arch Linux), écrite e
 | **Nettoyage** | Cache pacman (`paccache`), orphelins, journaux systemd, miniatures, cache personnel ancien, cache de compilation AUR, Flatpak inutilisés. |
 | **Diagnostic** | Services en échec, erreurs depuis le démarrage, santé SMART, état Btrfs, intégrité des paquets, fusion des `.pacnew` (`pacdiff`), plus gros paquets, déverrouillage de pacman. |
 | **Matériel** | Inventaire façon `inxi` : système et ordonnanceur (sched-ext), carte mère et BIOS, Secure Boot, processeur (cœurs, cache, pilote de fréquence, **niveau x86-64-v3/v4** pour les dépôts optimisés CachyOS), mémoire et zram, cartes graphiques (pilote, VRAM, OpenGL, Mesa), écrans, audio, réseau, disques et partitions, batterie, USB. **Températures et ventilateurs en direct.** Rapport copiable ou enregistrable en texte, détails des barrettes mémoire, rapport `inxi` complet si installé. |
+| **Santé des disques** | Une fiche par disque (NVMe, SSD SATA, disque dur) : **pourcentage de vie restante**, données écrites et lues, heures de fonctionnement, température, réserve de cellules, secteurs réalloués ou illisibles, erreurs de câble, résultat du dernier auto-test, et un verdict *Bon état / À surveiller / Critique* expliqué. Lancement d'un auto-test SMART. Résumé repris sur le tableau de bord. |
 | **Sécurité** | Instantanés snapper / Timeshift, vérification Btrfs (scrub), accès à Btrfs Assistant. |
 | **Historique** | Journal de toutes les opérations (`~/.local/state/cachy-maint/maintenance.log`). |
 
@@ -36,7 +37,7 @@ Désinstallation : `./uninstall.sh`
 git pull && ./install.sh
 ```
 
-Relancer `install.sh` est nécessaire quand le module administrateur évolue (c'est le cas en 2.1 pour les barrettes mémoire).
+Relancer `install.sh` est nécessaire quand le module administrateur évolue (c'est le cas en 2.1 pour les barrettes mémoire et en 2.2 pour la santé des disques).
 
 ## Sécurité et droits administrateur
 
