@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import (QObject, QProcess, QProcessEnvironment, QSize, Qt,
+from PySide6.QtCore import (QObject, QProcess, QProcessEnvironment, QSettings, QSize, Qt,
                             QThread, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
                            QIcon, QPalette, QTextCharFormat, QTextCursor)
@@ -24,16 +24,17 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFr
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel,
                                QListWidget, QListWidgetItem, QMainWindow,
                                QMessageBox, QPlainTextEdit, QProgressBar,
-                               QPushButton, QScrollArea, QSplitter, QStackedWidget, QTreeWidget,
+                               QPushButton, QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 APP_NAME = "Cachy Maint"
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 HELPER = "/usr/local/libexec/cachy-maint-helper"
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "cachy-maint"
 LOG = STATE / "maintenance.log"
 LAST_RUN = STATE / "last_run"
 HOME_CACHE = Path.home() / ".cache"
+CONSOLE_SMALL, CONSOLE_BIG = 110, 300
 
 GREEN, ORANGE, RED, BLUE = "#27ae60", "#f39c12", "#da4453", "#3daee9"
 REAL_FS = {"ext4", "ext3", "btrfs", "xfs", "f2fs", "vfat", "exfat", "ntfs3",
@@ -101,6 +102,24 @@ def find_terminal() -> list[str] | None:
         if have(name):
             return args
     return None
+
+
+def shortlist(items: list, keep: int) -> str:
+    """« a, b et 9 autres » : garde les cases compactes."""
+    shown = ", ".join(items[:keep])
+    return shown + (f" et {len(items) - keep} autre(s)" if len(items) > keep else "")
+
+
+def pretty_unit(unit: str) -> str:
+    """app-cachy\\x2dmaint@1050….service  →  cachy-maint (utilisateur)"""
+    prefix = ""
+    if unit.startswith("(utilisateur) "):
+        prefix, unit = "(utilisateur) ", unit[len("(utilisateur) "):]
+    unit = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), unit)
+    unit = re.sub(r"@[0-9a-f]{16,}", "", unit)
+    unit = re.sub(r"\.service$", "", unit)
+    unit = re.sub(r"^app-", "", unit)
+    return prefix + unit
 
 
 def log_line(text: str) -> None:
@@ -914,8 +933,10 @@ class Card(QFrame):
     def __init__(self, icon_name: str, title: str, button: str | None = None, slot=None):
         super().__init__()
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setMinimumHeight(140)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(2)
         top = QHBoxLayout()
         ic = QLabel()
         ic.setPixmap(icon(icon_name).pixmap(22, 22))
@@ -926,26 +947,31 @@ class Card(QFrame):
         lay.addLayout(top)
         self.value = QLabel("…")
         f = self.value.font()
-        f.setPointSizeF(f.pointSizeF() * 1.9)
+        f.setPointSizeF(f.pointSizeF() * 1.6)
         f.setBold(True)
         self.value.setFont(f)
-        lay.addWidget(self.value)
-        self.detail = muted(QLabel(""))
-        self.detail.setWordWrap(True)
-        lay.addWidget(self.detail)
-        lay.addStretch()
+        mid = QHBoxLayout()
+        mid.addWidget(self.value, 1)
         self.button = None
         if button:
             self.button = QPushButton(button)
             self.button.clicked.connect(slot)
             self.button.setEnabled(False)
-            lay.addWidget(self.button, alignment=Qt.AlignmentFlag.AlignLeft)
+            mid.addWidget(self.button)
+        lay.addLayout(mid)
+        self.detail = muted(QLabel(""))
+        self.detail.setWordWrap(True)
+        self.detail.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.detail.setMinimumWidth(1)
+        lay.addWidget(self.detail)
+        lay.addStretch()
 
     def set(self, value: str, detail: str = "", level: str = "ok", action: bool = False):
         color = {"ok": GREEN, "warn": ORANGE, "bad": RED, "info": BLUE}.get(level, "")
         self.value.setText(value)
         self.value.setStyleSheet(f"color:{color}" if color else "")
         self.detail.setText(detail)
+        self.detail.setToolTip(detail)
         if self.button:
             self.button.setEnabled(action)
 
@@ -978,21 +1004,21 @@ class ActionRow(QFrame):
 def page(title: str, subtitle: str) -> tuple[QScrollArea, QVBoxLayout]:
     inner = QWidget()
     lay = QVBoxLayout(inner)
-    lay.setContentsMargins(24, 20, 24, 20)
-    lay.setSpacing(10)
+    lay.setContentsMargins(20, 14, 20, 14)
+    lay.setSpacing(8)
     t = QLabel(title)
     f = t.font()
-    f.setPointSizeF(f.pointSizeF() * 1.6)
+    f.setPointSizeF(f.pointSizeF() * 1.45)
     f.setBold(True)
     t.setFont(f)
     lay.addWidget(t)
     s = muted(QLabel(subtitle))
     s.setWordWrap(True)
     lay.addWidget(s)
-    lay.addSpacing(6)
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     scroll.setWidget(inner)
     return scroll, lay
 
@@ -1011,7 +1037,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(icon("system-software-update"))
-        self.resize(1180, 820)
+        self.resize(1300, 900)
         self.data: dict = {}
         self.collector: Collector | None = None
         self.terminals: list[QProcess] = []
@@ -1064,6 +1090,11 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.progress)
         bar.addWidget(self.stop_btn)
         bar.addWidget(clear_btn)
+        self.console_toggle = QPushButton(icon("go-up"), "")
+        self.console_toggle.setToolTip("Agrandir / réduire la console")
+        self.console_toggle.setFlat(True)
+        self.console_toggle.clicked.connect(self.toggle_console)
+        bar.addWidget(self.console_toggle)
         cl.addLayout(bar)
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
@@ -1076,9 +1107,14 @@ class MainWindow(QMainWindow):
         right = QSplitter(Qt.Orientation.Vertical)
         right.addWidget(self.stack)
         right.addWidget(console_box)
-        right.setStretchFactor(0, 3)
-        right.setStretchFactor(1, 2)
-        right.setSizes([520, 280])
+        right.setStretchFactor(0, 1)
+        right.setStretchFactor(1, 0)
+        right.setCollapsible(0, False)
+        right.setCollapsible(1, False)
+        self.splitter = right
+        self.console_box = console_box
+        console_box.setMinimumHeight(70)
+        right.setSizes([10000, CONSOLE_SMALL])
 
         central = QWidget()
         h = QHBoxLayout(central)
@@ -1112,6 +1148,8 @@ class MainWindow(QMainWindow):
         for i, c in enumerate((self.c_upd, self.c_orph, self.c_fail, self.c_err,
                                self.c_pacnew, self.c_cache, self.c_reboot, self.c_last)):
             grid.addWidget(c, i // 4, i % 4)
+        for col in range(4):
+            grid.setColumnStretch(col, 1)
         lay.addLayout(grid)
 
         btns = QHBoxLayout()
@@ -1229,7 +1267,7 @@ class MainWindow(QMainWindow):
             ("view-sort-descending", "Paquets les plus volumineux", "Les 25 paquets qui prennent "
              "le plus de place.", "Afficher", self.big_packages),
             ("system-run", "Remettre à zéro les services en échec", "Efface l'état d'échec après "
-             "avoir corrigé le problème (administrateur).", "Réinitialiser", self.reset_failed),
+             "avoir corrigé le problème.", "Réinitialiser", self.reset_failed),
             ("object-unlocked", "Déverrouiller pacman", "Supprime un verrou laissé par une mise à "
              "jour interrompue, si aucun pacman ne tourne (administrateur).", "Déverrouiller", self.unlock),
         )
@@ -1269,7 +1307,7 @@ class MainWindow(QMainWindow):
         self.hw_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.hw_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.hw_tree.header().setStretchLastSection(True)
-        self.hw_tree.setMinimumHeight(460)
+        self.hw_tree.setMinimumHeight(280)
         self.hw_tree.setWordWrap(True)
         lay.addWidget(self.hw_tree, 1)
         self.hw_sensor_item: QTreeWidgetItem | None = None
@@ -1577,16 +1615,17 @@ class MainWindow(QMainWindow):
         self.dash_sub.setText(f"{d['os']} • {d['host']} • noyau {d['kernel']} • allumé depuis "
                               f"{d['uptime']} • {d['pkgs']} paquets ({d['foreign']} AUR/externes)")
         n = len(d["orphans"])
-        self.c_orph.set(str(n), ", ".join(d["orphans"][:6]) + ("…" if n > 6 else "") if n
+        self.c_orph.set(str(n), shortlist(d["orphans"], 3) if n
                         else "Rien à supprimer", "warn" if n else "ok", bool(n))
         n = len(d["failed"])
-        self.c_fail.set(str(n), ", ".join(d["failed"][:4]) if n else "Tout fonctionne",
+        self.c_fail.set(str(n), shortlist([pretty_unit(u) for u in d["failed"]], 2) if n
+                        else "Tout fonctionne",
                         "bad" if n else "ok", bool(n))
         n = d["errors"]
         self.c_err.set(str(n), "lignes d'erreur depuis le démarrage",
                        "ok" if n == 0 else ("warn" if n < 50 else "bad"), bool(n))
         n = len(d["pacnew"])
-        self.c_pacnew.set(str(n), "\n".join(Path(p).name for p in d["pacnew"][:3]) if n
+        self.c_pacnew.set(str(n), shortlist([Path(p).name for p in d["pacnew"]], 2) if n
                           else "Configuration à jour", "warn" if n else "ok", bool(n))
         size = d["pkgcache"] or 0
         self.c_cache.set(human(size), "/var/cache/pacman/pkg",
@@ -1684,7 +1723,20 @@ class MainWindow(QMainWindow):
         self.console.setTextCursor(cur)
         self.console.ensureCursorVisible()
 
+    def console_height(self) -> int:
+        return self.splitter.sizes()[1]
+
+    def set_console(self, height: int):
+        total = sum(self.splitter.sizes())
+        self.splitter.setSizes([max(200, total - height), height])
+        self.console_toggle.setIcon(icon("go-down" if height > CONSOLE_SMALL + 20 else "go-up"))
+
+    def toggle_console(self):
+        self.set_console(CONSOLE_BIG if self.console_height() <= CONSOLE_SMALL + 20 else CONSOLE_SMALL)
+
     def on_busy(self, busy: bool, label: str):
+        if busy and self.console_height() < CONSOLE_BIG:
+            self.set_console(CONSOLE_BIG)
         self.progress.setRange(0, 0 if busy else 1)
         self.stop_btn.setEnabled(busy)
         self.full_btn.setEnabled(not busy)
@@ -1896,7 +1948,10 @@ class MainWindow(QMainWindow):
         self.run("Paquets les plus volumineux", [Step("pacman -Qi", ["bash", "-c", script])])
 
     def reset_failed(self):
-        self.run("Services", [Step("systemctl reset-failed", ["reset-failed"], root=True)])
+        steps = [Step("Services utilisateur", ["systemctl", "--user", "reset-failed"], stop_on_fail=False)]
+        if any(not f.startswith("(utilisateur)") for f in self.data.get("failed", [])):
+            steps.append(Step("Services système", ["reset-failed"], root=True))
+        self.run("Remise à zéro des services en échec", steps)
 
     def unlock(self):
         if self.confirm("Déverrouiller pacman", "Supprimer le verrou de pacman ?\n"
@@ -1920,6 +1975,9 @@ class MainWindow(QMainWindow):
                                                              "Quitter quand même ?"):
             e.ignore()
             return
+        st = QSettings("cachy-maint", "cachy-maint")
+        st.setValue("geometry", self.saveGeometry())
+        st.setValue("maximized", self.isMaximized())
         e.accept()
 
 
@@ -1936,7 +1994,19 @@ def main():
                                              "CachyOS / Arch Linux.")
         sys.exit(1)
     w = MainWindow()
-    w.show()
+    st = QSettings("cachy-maint", "cachy-maint")
+    geo = st.value("geometry")
+    screen = app.primaryScreen().availableGeometry()
+    if geo is not None and w.restoreGeometry(geo):
+        pass
+    else:
+        # Première ouverture : grande fenêtre adaptée à l'écran, centrée
+        w.resize(min(1500, int(screen.width() * 0.88)), min(1000, int(screen.height() * 0.9)))
+        w.move(screen.center() - w.rect().center())
+    if str(st.value("maximized", "false")).lower() == "true" or screen.height() < 850:
+        w.showMaximized()
+    else:
+        w.show()
     sys.exit(app.exec())
 
 
