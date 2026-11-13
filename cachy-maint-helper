@@ -108,6 +108,13 @@ case "${1:-}" in
   scrub)
     findmnt -t btrfs / >/dev/null || { say "La racine n'est pas en Btrfs."; exit 0; }
     btrfs scrub start / && say "✔ Vérification lancée en arrière-plan. Résultat via « État Btrfs »." ;;
+  memory)
+    have dmidecode || { say "✘ dmidecode absent : sudo pacman -S dmidecode"; exit 1; }
+    dmidecode -t 16 | grep -E 'Maximum Capacity|Number Of Devices' | sed 's/^\s*/  /'
+    dmidecode -t 17 | awk -F': ' '
+      /^Memory Device/ {print "──"}
+      /^[ \t]+(Locator|Size|Type|Speed|Configured Memory Speed|Manufacturer|Part Number|Rank|Form Factor):/ {
+        gsub(/^[ \t]+/, ""); print "  " $0 }' ;;
   reset-failed)  systemctl reset-failed && say "✔ Compteurs d'échec des services remis à zéro." ;;
   unlock)
     if pgrep '^(pacman|paru|yay|pamac)$' >/dev/null; then say "✘ Un gestionnaire de paquets tourne : verrou conservé."; exit 1; fi

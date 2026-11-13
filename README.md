@@ -10,6 +10,7 @@ Application graphique de maintenance pour **CachyOS** (et Arch Linux), écrite e
 | **Mises à jour** | Liste des mises à jour (dépôts, AUR, Flatpak), mise à jour en un clic, AUR dans un terminal, classement des miroirs, micrologiciels (fwupd). |
 | **Nettoyage** | Cache pacman (`paccache`), orphelins, journaux systemd, miniatures, cache personnel ancien, cache de compilation AUR, Flatpak inutilisés. |
 | **Diagnostic** | Services en échec, erreurs depuis le démarrage, santé SMART, état Btrfs, intégrité des paquets, fusion des `.pacnew` (`pacdiff`), plus gros paquets, déverrouillage de pacman. |
+| **Matériel** | Inventaire façon `inxi` : système et ordonnanceur (sched-ext), carte mère et BIOS, Secure Boot, processeur (cœurs, cache, pilote de fréquence, **niveau x86-64-v3/v4** pour les dépôts optimisés CachyOS), mémoire et zram, cartes graphiques (pilote, VRAM, OpenGL, Mesa), écrans, audio, réseau, disques et partitions, batterie, USB. **Températures et ventilateurs en direct.** Rapport copiable ou enregistrable en texte, détails des barrettes mémoire, rapport `inxi` complet si installé. |
 | **Sécurité** | Instantanés snapper / Timeshift, vérification Btrfs (scrub), accès à Btrfs Assistant. |
 | **Historique** | Journal de toutes les opérations (`~/.local/state/cachy-maint/maintenance.log`). |
 
@@ -25,9 +26,17 @@ cd CachyMaint
 
 Puis lance **Cachy Maint** depuis le menu des applications (ou `cachy-maint-gui` dans un terminal).
 
-L'installateur ajoute les dépendances (`pyside6`, `pacman-contrib`, `smartmontools`), le module administrateur et la règle polkit. Optionnel : `fwupd` (micrologiciels), `meld` (fusion graphique des `.pacnew`).
+L'installateur ajoute les dépendances (`pyside6`, `pacman-contrib`, `smartmontools`, `pciutils`, `usbutils`, `dmidecode`), le module administrateur et la règle polkit. Optionnel : `fwupd` (micrologiciels), `meld` (fusion graphique des `.pacnew`).
 
 Désinstallation : `./uninstall.sh`
+
+## Mise à jour
+
+```bash
+git pull && ./install.sh
+```
+
+Relancer `install.sh` est nécessaire quand le module administrateur évolue (c'est le cas en 2.1 pour les barrettes mémoire).
 
 ## Sécurité et droits administrateur
 

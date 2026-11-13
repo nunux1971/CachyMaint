@@ -4,8 +4,8 @@ set -e
 cd "$(dirname "$0")"
 [[ $EUID -eq 0 ]] && { echo "Lance install.sh en utilisateur normal (sudo sera demandé)."; exit 1; }
 
-echo "➜ Dépendances (PySide6, pacman-contrib, smartmontools)…"
-sudo pacman -S --needed pyside6 pacman-contrib smartmontools
+echo "➜ Dépendances (PySide6, pacman-contrib, smartmontools, outils matériel)…"
+sudo pacman -S --needed pyside6 pacman-contrib smartmontools pciutils usbutils dmidecode
 
 echo "➜ Module administrateur et règle polkit…"
 sudo install -Dm755 -o root -g root cachy-maint-helper /usr/local/libexec/cachy-maint-helper

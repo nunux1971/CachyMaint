@@ -20,7 +20,7 @@ from PySide6.QtCore import (QObject, QProcess, QProcessEnvironment, QSize, Qt,
                             QThread, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase,
                            QIcon, QPalette, QTextCharFormat, QTextCursor)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFileDialog, QFrame,
                                QGridLayout, QHBoxLayout, QHeaderView, QLabel,
                                QListWidget, QListWidgetItem, QMainWindow,
                                QMessageBox, QPlainTextEdit, QProgressBar,
@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QFrame,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 APP_NAME = "Cachy Maint"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 HELPER = "/usr/local/libexec/cachy-maint-helper"
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "cachy-maint"
 LOG = STATE / "maintenance.log"
@@ -215,6 +215,374 @@ def collect_slow() -> dict:
             if cols and cols[0] and "." in cols[0]:
                 d["updates"].append((cols[0], "", cols[1] if len(cols) > 1 else "", "Flatpak"))
     return d
+
+
+# =============================================================================
+#  Matériel (à la manière d'inxi : /sys, /proc, lspci, lsusb, lsblk)
+# =============================================================================
+def read(path, default: str = "") -> str:
+    try:
+        return Path(path).read_text(errors="replace").strip()
+    except OSError:
+        return default
+
+
+def size_iec(n: int | float | None) -> str:
+    """Taille lisible, en puissances de 1024 (« Go » = Gio comme le fait KDE)."""
+    return human(n) if n else "?"
+
+
+def clean_pci_name(name: str) -> str:
+    return re.sub(r"\s*\(rev \w+\)$", "", name).strip()
+
+
+CHASSIS = {3: "Ordinateur de bureau", 4: "Bureau compact", 6: "Mini-tour", 7: "Tour",
+           8: "Portable", 9: "Ordinateur portable", 10: "Ordinateur portable",
+           13: "Tout-en-un", 14: "Ultraportable", 30: "Tablette", 31: "Convertible",
+           32: "Détachable", 35: "Mini PC", 36: "PC clé"}
+
+SENSOR_NAMES = {"k10temp": "Processeur", "coretemp": "Processeur", "zenpower": "Processeur",
+                "amdgpu": "Carte graphique", "nouveau": "Carte graphique", "nvme": "SSD NVMe",
+                "drivetemp": "Disque", "acpitz": "Carte mère (ACPI)", "iwlwifi_1": "Wi-Fi",
+                "mt7921_phy0": "Wi-Fi", "spd5118": "Mémoire", "jc42": "Mémoire"}
+
+
+def pci_devices() -> list[dict]:
+    _, out = sh(["lspci", "-k"])
+    devs, cur = [], None
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            slot, _, rest = line.partition(" ")
+            cls, _, name = rest.partition(": ")
+            cur = {"slot": slot, "class": cls, "name": clean_pci_name(name), "driver": ""}
+            devs.append(cur)
+        elif cur is not None and "Kernel driver in use:" in line:
+            cur["driver"] = line.split(":", 1)[1].strip()
+    return devs
+
+
+def x86_level() -> str:
+    for ld in ("/usr/lib/ld-linux-x86-64.so.2", "/lib64/ld-linux-x86-64.so.2"):
+        if Path(ld).exists():
+            _, out = sh([ld, "--help"])
+            levels = re.findall(r"x86-64-(v\d) \(supported", out)
+            if levels:
+                return "x86-64-" + max(levels)
+    flags = set()
+    for line in read("/proc/cpuinfo").splitlines():
+        if line.startswith("flags"):
+            flags = set(line.split(":", 1)[1].split())
+            break
+    if {"avx512f", "avx512bw", "avx512cd", "avx512dq", "avx512vl"} <= flags:
+        return "x86-64-v4"
+    if {"avx2", "bmi2", "fma", "movbe"} <= flags:
+        return "x86-64-v3"
+    if {"sse4_2", "popcnt", "ssse3"} <= flags:
+        return "x86-64-v2"
+    return "x86-64"
+
+
+def edid_name(path: Path) -> str:
+    try:
+        e = path.read_bytes()
+    except OSError:
+        return ""
+    for i in range(54, 126, 18):
+        d = e[i:i + 18]
+        if len(d) == 18 and d[:3] == b"\0\0\0" and d[3] == 0xFC:
+            return d[5:].split(b"\n")[0].decode("ascii", "replace").strip()
+    return ""
+
+
+def hw_system() -> list:
+    osr = dict(line.partition("=")[::2] for line in read("/etc/os-release").splitlines() if "=" in line)
+    rows = [("Distribution", osr.get("PRETTY_NAME", "?").strip('"')),
+            ("Noyau", f"{platform.release()} ({platform.machine()})")]
+    de = os.environ.get("XDG_CURRENT_DESKTOP", "")
+    if have("plasmashell"):
+        v = sh(["plasmashell", "--version"])[1].split()
+        de = f"KDE Plasma {v[-1]}" if v else "KDE Plasma"
+    rows.append(("Bureau", f"{de or '?'} — session {os.environ.get('XDG_SESSION_TYPE', '?')}"))
+    sched = read("/sys/kernel/sched_ext/root/ops")
+    if read("/sys/kernel/sched_ext/state") == "enabled" and sched:
+        rows.append(("Ordonnanceur", f"sched-ext : {sched}"))
+    else:
+        rows.append(("Ordonnanceur", "standard du noyau (EEVDF / BORE)"))
+    repos = re.findall(r"^\[(cachyos[^\]]*)\]", read("/etc/pacman.conf"), re.M)
+    if repos:
+        rows.append(("Dépôts CachyOS", ", ".join(repos)))
+    rows.append(("Init", read("/proc/1/comm", "?")))
+    rows.append(("Shell", Path(os.environ.get("SHELL", "?")).name))
+    return rows
+
+
+def hw_machine() -> list:
+    dmi = Path("/sys/class/dmi/id")
+    rows = []
+    vendor, product = read(dmi / "sys_vendor"), read(dmi / "product_name")
+    junk = {"", "To Be Filled By O.E.M.", "System Product Name", "Default string", "System manufacturer"}
+    if product not in junk:
+        rows.append(("Modèle", f"{vendor} {product}".strip()))
+    try:
+        rows.append(("Type", CHASSIS.get(int(read(dmi / "chassis_type", "0")), "Autre")))
+    except ValueError:
+        pass
+    rows.append(("Carte mère", f"{read(dmi / 'board_vendor')} {read(dmi / 'board_name')}".strip() or "?"))
+    bios = f"{read(dmi / 'bios_vendor')} {read(dmi / 'bios_version')}".strip()
+    if read(dmi / "bios_date"):
+        bios += f" du {read(dmi / 'bios_date')}"
+    rows.append(("BIOS / UEFI", bios or "?"))
+    if Path("/sys/firmware/efi").exists():
+        sb = "?"
+        for f in Path("/sys/firmware/efi/efivars").glob("SecureBoot-*"):
+            try:
+                sb = "activé" if f.read_bytes()[-1] == 1 else "désactivé"
+            except (OSError, IndexError):
+                pass
+        rows.append(("Démarrage", f"UEFI, Secure Boot {sb}"))
+    else:
+        rows.append(("Démarrage", "BIOS (Legacy)"))
+    return rows
+
+
+def hw_cpu() -> list:
+    _, out = sh(["lscpu"])
+    info = {k.strip(): v.strip() for k, _, v in (l.partition(":") for l in out.splitlines())}
+    rows = [("Modèle", info.get("Model name", "?"))]
+    try:
+        cores = int(info.get("Core(s) per socket", 0)) * int(info.get("Socket(s)", 1))
+        rows.append(("Cœurs / threads", f"{cores} cœurs, {info.get('CPU(s)', '?')} threads"))
+    except ValueError:
+        pass
+    mx, mn = info.get("CPU max MHz"), info.get("CPU min MHz")
+    if mx:
+        rows.append(("Fréquence", f"{float(mn or 0):.0f} – {float(mx):.0f} MHz"))
+    caches = [f"{k.split()[0]} {info[k].split(' (')[0]}" for k in ("L1d cache", "L2 cache", "L3 cache")
+              if info.get(k)]
+    if caches:
+        rows.append(("Cache", ", ".join(caches)))
+    lvl = x86_level()
+    hint = {"x86-64-v4": " → dépôts cachyos-v4 / znver4 possibles",
+            "x86-64-v3": " → dépôts cachyos-v3 possibles"}.get(lvl, "")
+    rows.append(("Niveau ISA", lvl + hint))
+    cpu0 = Path("/sys/devices/system/cpu/cpu0/cpufreq")
+    drv, gov = read(cpu0 / "scaling_driver"), read(cpu0 / "scaling_governor")
+    if drv:
+        epp = read(cpu0 / "energy_performance_preference")
+        rows.append(("Pilote fréquence", f"{drv}, gouverneur {gov}" + (f", EPP {epp}" if epp else "")))
+    if info.get("Virtualization"):
+        rows.append(("Virtualisation", info["Virtualization"]))
+    mc = re.search(r"^microcode\s*:\s*(\S+)", read("/proc/cpuinfo"), re.M)
+    if mc:
+        rows.append(("Microcode", mc.group(1)))
+    return rows
+
+
+def hw_memory() -> list:
+    mi = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        try:
+            mi[k] = int(v.split()[0]) * 1024
+        except (IndexError, ValueError):
+            pass
+    tot, avail = mi.get("MemTotal", 0), mi.get("MemAvailable", 0)
+    rows = [("Mémoire vive", f"{size_iec(tot)} — {size_iec(tot - avail)} utilisés "
+                             f"({(tot - avail) * 100 // tot if tot else 0} %)")]
+    for z in sorted(Path("/sys/block").glob("zram*")):
+        algo = re.search(r"\[(\w+)\]", read(z / "comp_algorithm"))
+        size = read(z / "disksize", "0")
+        if size.isdigit() and int(size):
+            rows.append((f"Swap {z.name}", f"{size_iec(int(size))} compressé "
+                                           f"({algo.group(1) if algo else '?'})"))
+    for line in read("/proc/swaps").splitlines()[1:]:
+        p = line.split()
+        if p and "zram" not in p[0]:
+            rows.append(("Swap", f"{p[0]} — {size_iec(int(p[2]) * 1024)}"))
+    if not any(r[0].startswith("Swap") for r in rows):
+        rows.append(("Swap", "aucun"))
+    rows.append(("Barrettes", "détails via le bouton « Barrettes mémoire »"))
+    return rows
+
+
+def hw_graphics(pci: list) -> list:
+    rows = []
+    gpus = [d for d in pci if d["class"] in ("VGA compatible controller", "3D controller",
+                                              "Display controller")]
+    for i, g in enumerate(gpus, 1):
+        key = "Carte graphique" + (f" {i}" if len(gpus) > 1 else "")
+        rows.append((key, g["name"]))
+        extra = [f"pilote {g['driver'] or 'aucun'}"]
+        vram = read(f"/sys/bus/pci/devices/0000:{g['slot']}/mem_info_vram_total")
+        if vram.isdigit():
+            extra.append(f"{size_iec(int(vram))} de VRAM")
+        rows.append(("   Détails", ", ".join(extra)))
+    if have("nvidia-smi") and any(g["driver"] == "nvidia" for g in gpus):
+        _, out = sh(["nvidia-smi", "--query-gpu=name,driver_version,memory.total",
+                     "--format=csv,noheader"])
+        for line in out.splitlines():
+            rows.append(("   NVIDIA", line.strip()))
+    if have("glxinfo"):
+        _, out = sh(["glxinfo", "-B"])
+        r = re.search(r"OpenGL renderer string: (.+)", out)
+        v = re.search(r"OpenGL core profile version string: (.+)", out) or \
+            re.search(r"OpenGL version string: (.+)", out)
+        if r:
+            rows.append(("OpenGL", f"{r.group(1)}" + (f" — {v.group(1)}" if v else "")))
+    mesa = sh(["pacman", "-Q", "mesa"])[1].split()
+    if len(mesa) == 2:
+        rows.append(("Mesa", mesa[1]))
+    for c in sorted(Path("/sys/class/drm").glob("card*-*")):
+        if read(c / "status") != "connected":
+            continue
+        mode = read(c / "modes").splitlines()
+        name = edid_name(c / "edid")
+        conn = c.name.split("-", 1)[1]
+        rows.append((f"Écran {conn}", f"{name or 'écran'} — {mode[0] if mode else '?'}"))
+    return rows or [("Carte graphique", "aucune détectée")]
+
+
+def hw_audio(pci: list) -> list:
+    rows = [("Carte son", f"{d['name']} (pilote {d['driver'] or 'aucun'})")
+            for d in pci if d["class"] in ("Audio device", "Multimedia audio controller")]
+    server = "?"
+    if have("pactl"):
+        m = re.search(r"Server Name: (.+)", sh(["pactl", "info"])[1])
+        if m:
+            server = m.group(1)
+    rows.append(("Serveur son", server))
+    return rows
+
+
+def hw_network(pci: list) -> list:
+    rows = [("Contrôleur", f"{d['name']} (pilote {d['driver'] or 'aucun'})")
+            for d in pci if d["class"] in ("Ethernet controller", "Network controller")]
+    for n in sorted(Path("/sys/class/net").iterdir()) if Path("/sys/class/net").exists() else []:
+        if n.name == "lo" or not (n / "device").exists():
+            continue
+        wifi = (n / "wireless").exists() or (n / "phy80211").exists()
+        state = read(n / "operstate")
+        txt = f"{'Wi-Fi' if wifi else 'Ethernet'}, {'connecté' if state == 'up' else 'déconnecté'}"
+        speed = read(n / "speed")
+        if state == "up" and speed.lstrip("-").isdigit() and int(speed) > 0:
+            txt += f" à {int(speed) / 1000:g} Gb/s" if int(speed) >= 1000 else f" à {speed} Mb/s"
+        rows.append((f"Interface {n.name}", txt))
+    return rows or [("Réseau", "aucune interface physique")]
+
+
+def hw_storage() -> list:
+    import json
+    _, out = sh(["lsblk", "-J", "-b", "-o", "NAME,MODEL,SIZE,TYPE,ROTA,TRAN,FSTYPE,MOUNTPOINTS"])
+    try:
+        devs = json.loads(out).get("blockdevices", [])
+    except ValueError:
+        return [("Stockage", "lsblk indisponible")]
+    rows, total = [], 0
+    for d in devs:
+        if d.get("type") != "disk" or d["name"].startswith(("zram", "loop")):
+            continue
+        total += int(d.get("size") or 0)
+        kind = "NVMe" if d.get("tran") == "nvme" else ("HDD" if d.get("rota") in (True, "1") else "SSD")
+        tran = (d.get("tran") or "").upper()
+        rows.append((f"/dev/{d['name']}", f"{(d.get('model') or 'Disque').strip()} — "
+                                         f"{size_iec(int(d.get('size') or 0))}, {kind}"
+                                         + (f" ({tran})" if tran and tran != "NVME" else "")))
+        for p in d.get("children", []) or []:
+            mps = [m for m in (p.get("mountpoints") or []) if m]
+            if not mps and not p.get("fstype"):
+                continue
+            shown = ", ".join(mps[:3]) + ("…" if len(mps) > 3 else "")
+            rows.append((f"   {p['name']}", f"{p.get('fstype') or '?'}, {size_iec(int(p.get('size') or 0))}"
+                                            + (f" → {shown}" if shown else "")))
+    rows.insert(0, ("Capacité totale", size_iec(total)))
+    return rows
+
+
+def hw_sensors() -> list:
+    rows, seen = [], {}
+    for h in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        raw = read(h / "name")
+        base = SENSOR_NAMES.get(raw, raw)
+        for t in sorted(h.glob("temp*_input")):
+            try:
+                c = int(read(t, "0")) / 1000
+            except ValueError:
+                continue
+            if c <= 0 or c > 150:
+                continue
+            label = read(t.with_name(t.name.replace("_input", "_label"))) or t.name.split("_")[0]
+            key = f"{base} ({label})"
+            seen[key] = seen.get(key, 0) + 1
+            if seen[key] > 1:
+                key += f" #{seen[key]}"
+            rows.append((key, f"{c:.1f} °C"))
+        for f in sorted(h.glob("fan*_input")):
+            rpm = read(f)
+            if rpm.isdigit() and int(rpm) > 0:
+                rows.append((f"{base} ({read(f.with_name(f.name.replace('_input', '_label'))) or f.name[:4]})",
+                             f"{rpm} tr/min"))
+    return rows or [("Capteurs", "aucun capteur lisible (paquet lm_sensors ?)")]
+
+
+def hw_battery() -> list:
+    rows = []
+    for b in sorted(Path("/sys/class/power_supply").glob("BAT*")):
+        full = read(b / "energy_full") or read(b / "charge_full")
+        design = read(b / "energy_full_design") or read(b / "charge_full_design")
+        txt = f"{read(b / 'capacity', '?')} %, {read(b / 'status', '?')}"
+        if full.isdigit() and design.isdigit() and int(design):
+            txt += f", santé {int(full) * 100 // int(design)} %"
+        cyc = read(b / "cycle_count")
+        if cyc.isdigit() and int(cyc):
+            txt += f", {cyc} cycles"
+        rows.append((b.name, txt))
+    return rows
+
+
+def hw_usb() -> list:
+    rows = []
+    for line in sh(["lsusb"])[1].splitlines():
+        m = re.match(r"Bus \d+ Device \d+: ID (\S+) (.*)", line)
+        if m and "Linux Foundation" not in m.group(2):
+            rows.append((m.group(2).strip() or "Périphérique", m.group(1)))
+    return rows or [("USB", "aucun périphérique")]
+
+
+def collect_hardware() -> list[tuple[str, str, list]]:
+    pci = pci_devices()
+    sections = [("Système", "computer", hw_system()),
+                ("Machine", "preferences-devices-tree", hw_machine()),
+                ("Processeur", "cpu", hw_cpu()),
+                ("Mémoire", "media-flash", hw_memory()),
+                ("Graphismes", "video-display", hw_graphics(pci)),
+                ("Audio", "audio-card", hw_audio(pci)),
+                ("Réseau", "network-wired", hw_network(pci)),
+                ("Stockage", "drive-harddisk", hw_storage()),
+                ("Capteurs", "temperature-normal", hw_sensors())]
+    bat = hw_battery()
+    if bat:
+        sections.append(("Batterie", "battery", bat))
+    sections.append(("Périphériques USB", "drive-removable-media-usb", hw_usb()))
+    return sections
+
+
+def hardware_report(sections) -> str:
+    out = [f"Rapport matériel — {APP_NAME} {VERSION} — {dt.datetime.now():%d/%m/%Y %H:%M}", ""]
+    for title, _, rows in sections:
+        out.append(f"{title}:")
+        width = max((len(k.strip()) for k, _ in rows), default=0)
+        for k, v in rows:
+            indent = "      " if k.startswith("   ") else "  "
+            out.append(f"{indent}{k.strip():<{width}}  {v}")
+        out.append("")
+    return "\n".join(out)
+
+
+class HardwareCollector(QThread):
+    ready = Signal(list)
+
+    def run(self):
+        self.ready.emit(collect_hardware())
 
 
 class Collector(QThread):
@@ -473,13 +841,14 @@ class MainWindow(QMainWindow):
             ("Mises à jour", "system-software-update", self.build_updates),
             ("Nettoyage", "edit-clear-all", self.build_cleanup),
             ("Diagnostic", "dialog-information", self.build_diagnostic),
+            ("Matériel", "preferences-devices-tree", self.build_hardware),
             ("Sécurité", "security-high", self.build_security),
             ("Historique", "view-history", self.build_history),
         ):
-            QListWidgetItem(icon(ic), name, self.nav)
+            QListWidgetItem(icon(ic, "computer"), name, self.nav)
             self.stack.addWidget(builder())
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.nav.currentRowChanged.connect(lambda i: i == 5 and self.load_history())
+        self.nav.currentRowChanged.connect(self.on_page)
         self.nav.setCurrentRow(0)
 
         # ----- Console
@@ -689,6 +1058,127 @@ class MainWindow(QMainWindow):
                                                                              else "btrfs-assistant", [])))
         lay.addStretch()
         return w
+
+    def build_hardware(self):
+        w, lay = page("Matériel", "Inventaire du matériel et des pilotes, à la manière d'inxi. "
+                                  "Les températures se mettent à jour en direct.")
+        self.hw_sections: list = []
+        self.hw_collector: HardwareCollector | None = None
+        self.hw_tree = QTreeWidget()
+        self.hw_tree.setHeaderLabels(["Élément", "Information"])
+        self.hw_tree.setAlternatingRowColors(True)
+        self.hw_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.hw_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.hw_tree.header().setStretchLastSection(True)
+        self.hw_tree.setMinimumHeight(460)
+        self.hw_tree.setWordWrap(True)
+        lay.addWidget(self.hw_tree, 1)
+        self.hw_sensor_item: QTreeWidgetItem | None = None
+
+        row = QHBoxLayout()
+        b = QPushButton(icon("view-refresh"), "Actualiser")
+        b.clicked.connect(self.load_hardware)
+        row.addWidget(b)
+        b = QPushButton(icon("edit-copy"), "Copier le rapport")
+        b.clicked.connect(self.copy_hardware)
+        row.addWidget(b)
+        b = QPushButton(icon("document-save"), "Enregistrer…")
+        b.clicked.connect(self.save_hardware)
+        row.addWidget(b)
+        b = QPushButton(icon("media-flash"), "Barrettes mémoire")
+        b.setToolTip("Fabricant, vitesse et emplacement de chaque barrette (mot de passe requis)")
+        b.clicked.connect(lambda: self.run("Barrettes mémoire", [Step("dmidecode", ["memory"], root=True)]))
+        row.addWidget(b)
+        if have("inxi"):
+            b = QPushButton(icon("utilities-terminal"), "Rapport inxi complet")
+            b.clicked.connect(lambda: self.run("Rapport inxi", [
+                Step("inxi -Fxxz", ["inxi", "-Fxxz", "-c", "0"])]))
+            row.addWidget(b)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self.sensor_timer = QTimer(self)
+        self.sensor_timer.setInterval(3000)
+        self.sensor_timer.timeout.connect(self.update_sensors)
+        return w
+
+    def on_page(self, i: int):
+        name = self.nav.item(i).text() if self.nav.item(i) else ""
+        if name == "Historique":
+            self.load_history()
+        if name == "Matériel":
+            if not self.hw_sections:
+                self.load_hardware()
+            self.sensor_timer.start()
+        else:
+            self.sensor_timer.stop()
+
+    def load_hardware(self):
+        if self.hw_collector and self.hw_collector.isRunning():
+            return
+        self.hw_tree.clear()
+        QTreeWidgetItem(self.hw_tree, ["Analyse du matériel…", ""])
+        self.hw_collector = HardwareCollector(self)
+        self.hw_collector.ready.connect(self.show_hardware)
+        self.hw_collector.start()
+
+    def show_hardware(self, sections: list):
+        self.hw_sections = sections
+        self.hw_tree.clear()
+        self.hw_sensor_item = None
+        bold = self.hw_tree.font()
+        bold.setBold(True)
+        for title, ic, rows in sections:
+            top = QTreeWidgetItem(self.hw_tree, [title, ""])
+            top.setIcon(0, icon(ic, "computer"))
+            top.setFont(0, bold)
+            top.setFirstColumnSpanned(True)
+            self._fill(top, rows)
+            top.setExpanded(title != "Périphériques USB")
+            if title == "Capteurs":
+                self.hw_sensor_item = top
+
+    def _fill(self, parent: QTreeWidgetItem, rows: list):
+        last = parent
+        for k, v in rows:
+            if k.startswith("   "):          # sous-ligne rattachée à la précédente
+                QTreeWidgetItem(last, [k.strip(), v])
+                last.setExpanded(True)
+            else:
+                last = QTreeWidgetItem(parent, [k, v])
+                last.setToolTip(1, v)
+
+    def update_sensors(self):
+        if not self.hw_sensor_item or not self.isVisible():
+            return
+        rows = hw_sensors()
+        self.hw_sensor_item.takeChildren()
+        self._fill(self.hw_sensor_item, rows)
+        for i, (title, ic, _) in enumerate(self.hw_sections):
+            if title == "Capteurs":
+                self.hw_sections[i] = (title, ic, rows)
+        for i in range(self.hw_sensor_item.childCount()):
+            it = self.hw_sensor_item.child(i)
+            m = re.match(r"([\d.]+) °C", it.text(1))
+            if m:
+                t = float(m.group(1))
+                it.setForeground(1, QColor(RED if t >= 85 else ORANGE if t >= 70 else GREEN))
+
+    def copy_hardware(self):
+        if not self.hw_sections:
+            return
+        QApplication.clipboard().setText(hardware_report(self.hw_sections))
+        self.write("✔ Rapport matériel copié dans le presse-papiers.", "ok")
+
+    def save_hardware(self):
+        if not self.hw_sections:
+            return
+        default = str(Path.home() / f"materiel-{platform.node()}-{dt.date.today()}.txt")
+        path, _ = QFileDialog.getSaveFileName(self, "Enregistrer le rapport", default,
+                                              "Texte (*.txt)")
+        if path:
+            Path(path).write_text(hardware_report(self.hw_sections), encoding="utf-8")
+            self.write(f"✔ Rapport enregistré : {path}", "ok")
 
     def build_history(self):
         w, lay = page("Historique", f"Journal des opérations : {LOG}")
