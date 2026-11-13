@@ -610,6 +610,26 @@ def fmt_tb(n: float) -> str:
     return f"{n / 1e12:.2f} To" if n >= 1e12 else f"{n / 1e9:.0f} Go"
 
 
+SELFTEST_FR = (
+    (r"without error", "Réussi, aucune erreur"),
+    (r"in progress", "En cours…"),
+    (r"aborted.*host reset", "Interrompu (réinitialisation du système)"),
+    (r"aborted|interrupted", "Interrompu avant la fin (sans gravité)"),
+    (r"read failure", "Échec : erreur de lecture"),
+    (r"electrical failure", "Échec : défaut électrique"),
+    (r"servo|seek", "Échec : défaut mécanique"),
+    (r"handling damage", "Échec : dommage physique"),
+    (r"fail", "Échec"),
+)
+
+
+def selftest_fr(text: str) -> str:
+    for pat, fr in SELFTEST_FR:
+        if re.search(pat, text, re.I):
+            return fr
+    return text
+
+
 def analyze_smart(dev: str, j: dict) -> dict:
     """Résume la sortie JSON de smartctl en verdict + lignes lisibles."""
     r = {"dev": dev, "model": j.get("model_name") or j.get("model_family") or "Disque",
@@ -722,7 +742,7 @@ def analyze_smart(dev: str, j: dict) -> dict:
         if t:
             test = (t[0].get("status") or {}).get("string")
     if test:
-        rows.append(("Dernier auto-test", test))
+        rows.append(("Dernier auto-test", selftest_fr(test)))
         if re.search(r"fail", test, re.I):
             bad = True
             reasons.append(f"Le dernier auto-test a échoué : {test}")
@@ -1384,7 +1404,8 @@ class MainWindow(QMainWindow):
         cap = human(d["capacity"]) if d.get("capacity") else ""
         head.addWidget(QLabel(f"<b>{html.escape(d['model'])}</b><br><small>{d['dev']} • "
                               f"{d.get('kind', '?')}{' • ' + cap if cap else ''}</small>"), 1)
-        verdict = QLabel(html.escape(d["verdict"]))
+        verdict = QLabel(d["verdict"])
+        verdict.setTextFormat(Qt.TextFormat.PlainText)
         verdict.setStyleSheet(f"color:{col}; font-weight:bold")
         head.addWidget(verdict)
         v.addLayout(head)
@@ -1405,10 +1426,13 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(16)
         for i, (k, val) in enumerate(d["rows"]):
             grid.addWidget(muted(QLabel(k)), i, 0)
-            grid.addWidget(QLabel(html.escape(str(val))), i, 1)
+            val_label = QLabel(str(val))
+            val_label.setTextFormat(Qt.TextFormat.PlainText)
+            grid.addWidget(val_label, i, 1)
         grid.setColumnStretch(1, 1)
         v.addLayout(grid)
-        reasons = QLabel("<br>".join("• " + html.escape(x) for x in d["reasons"]))
+        reasons = QLabel("<br>".join("• " + html.escape(x, quote=False) for x in d["reasons"]))
+        reasons.setTextFormat(Qt.TextFormat.RichText)
         reasons.setWordWrap(True)
         if d["level"] in ("warn", "bad"):
             reasons.setStyleSheet(f"color:{col}")
